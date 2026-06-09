@@ -1,0 +1,150 @@
+# fusion-box wine patch 0002
+# Stop wl_subsurface_place_above thrashing in wayland_surface_reconfigure_subsurface.
+#
+# Bug observed in wine 11.10:
+# wayland_surface_reconfigure_subsurface() is called on every subsurface
+# reconfigure (which happens constantly during normal app operation - every
+# paint, layout change, or window message). Each call emits:
+#
+#     wl_subsurface_place_above(surface->wl_subsurface, anchor->wl_surface)
+#
+# Per the Wayland spec, place_above(sub, ref) puts `sub` IMMEDIATELY above
+# `ref` in the parent's sibling stack. When multiple sibling subsurfaces all
+# reconfigure against the same anchor (which happens routinely - Win32 child
+# windows typically share their toplevel's client area as an anchor), only
+# the LAST caller ends up topmost. Every subsequent reconfigure of any
+# sibling re-buries the others one layer down.
+#
+# Empirical reproducer: Autodesk Fusion 360 under wine 11.10 + winewayland.drv
+# on KDE Plasma 6. Fusion creates ~10 sibling subsurfaces for its UI overlays
+# (toolbar, dock, comments, view-cube widget, etc.) all parented to the main
+# toplevel. The bottom toolbar (subsurface positioned at (7, 1286), 300x25)
+# gets its place_above call ONCE at initial setup, never re-asserts. The
+# full-content-area subsurfaces (2554x1245 covering most of the window) get
+# place_above called on every frame. After the first frame, the bottom
+# toolbar is buried under them and invisible. Same pattern hides tooltips,
+# popup menus, and various floating Qt widgets.
+#
+# Fix: drop the place_above calls from the reconfigure path. The initial
+# subsurface placement (done elsewhere when the subsurface is first attached
+# to its parent) is sufficient - the Wayland compositor maintains relative
+# z-order until an explicit reorder request. We let it. Reconfigure should
+# only update position/size, not re-stack.
+#
+# Status: empirically verified on 2026-06-07 against Fusion 360 v2703.1.11.
+# With this patch, the bottom toolbar, comments panel, and ribbon tooltips
+# (previously invisible due to burying) all render. Several other UI bugs in
+# Fusion (popup menu misposition, Browser dock visibility, splash overlay
+# not dismissing) remain - they have separate causes still being investigated.
+#
+# Upstream: candidate for submission to wine-devel. Reviewer would be
+# Alexandros Frantzis @ Collabora (author of the "winewayland.drv: part N"
+# series - !2476, !2944, !4014, !4203, !4947). The patch is a one-block
+# removal with rationale; no behavior change for single-subsurface scenarios.
+#
+# Apply from the wine source root: `patch -p1 < this-file`
+#
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -829,7 +829,19 @@
+     if (client->wl_subsurface)
+     {
+         wl_subsurface_set_position(client->wl_subsurface, x, y);
+-        wl_subsurface_place_above(client->wl_subsurface, surface->wl_surface);
++        /* fusion-box: do NOT re-place_above on every reconfigure. Each call
++         * to wl_subsurface_place_above(sub, ref) puts `sub` immediately
++         * above `ref` in the parent's stack; when multiple sibling client
++         * subsurfaces all reconfigure against the same toplevel anchor
++         * (which happens on every xdg_toplevel.configure event - i.e. every
++         * focus/resize/state change), the iteration order determines z-order
++         * and prior callers get pushed UP the stack, making the FIRST-called
++         * subsurface end up topmost. For apps with multiple overlapping
++         * sibling Win32 children (Autodesk Fusion 360, anything Qt
++         * QStackedWidget-style), this produces the visible-topmost subsurface
++         * shuffling on every focus change. The initial subsurface creation
++         * already places it correctly; the wayland compositor maintains
++         * relative z-order until an explicit reorder. Let it. */
+     }
+ 
+     if (width != 0 && height != 0)
+@@ -908,10 +920,17 @@
+         TRACE("hwnd=%p pos=%d,%d\n", surface->hwnd, x, y);
+ 
+         wl_subsurface_set_position(surface->wl_subsurface, x, y);
+-        if (toplevel_data->client_surface)
+-            wl_subsurface_place_above(surface->wl_subsurface, toplevel_data->client_surface->wl_surface);
+-        else
+-            wl_subsurface_place_above(surface->wl_subsurface, toplevel_surface->wl_surface);
++        /* fusion-box: place_above intentionally removed from the reconfigure
++         * path. Every wl_subsurface_place_above(sub, ref) puts `sub`
++         * IMMEDIATELY above `ref` per Wayland spec - when multiple sibling
++         * subsurfaces all reconfigure against the same toplevel/client anchor
++         * (which Fusion 360 does constantly), the last caller wins and every
++         * other sibling gets pushed one layer down. Empirically this buries
++         * static UI overlays like Fusion's bottom toolbar (subsurface stays
++         * placed where it was last set, but other surfaces keep promoting
++         * themselves above it on every paint). The initial subsurface
++         * creation already places it correctly; the wayland compositor
++         * maintains relative z-order until an explicit reorder. We let it. */
+         wl_surface_commit(toplevel_surface->wl_surface);
+ 
+         memset(&surface->processing, 0, sizeof(surface->processing));
+@@ -1383,17 +1402,21 @@
+     HWND hwnd = client->client.hwnd;
+     RECT client_rect;
+ 
+-    if (!toplevel)
+-    {
+-        if (client->wl_subsurface)
+-        {
+-            wl_subsurface_destroy(client->wl_subsurface);
+-            client->wl_subsurface = NULL;
+-        }
+-
+-        client->toplevel = 0;
+-        return;
+-    }
++    /* fusion-box: do NOT destroy the wl_subsurface on transient "detach"
++     * calls. Destroy + later recreate puts the new subsurface at the TOP
++     * of the parent's substack per Wayland spec - for multiple sibling
++     * child windows whose attach/detach pattern is driven by focus/configure
++     * events (Autodesk Fusion 360, Qt QStackedWidget-style apps), this
++     * causes "last to recreate wins" - the visible-topmost subsurface
++     * shuffles randomly on every focus change. And detaching the buffer
++     * (wl_surface_attach NULL) would unconditionally hide GPU-rendered
++     * content that Vulkan/OpenGL already attached, leaving blank.
++     *
++     * Keep the subsurface, its buffer, and our toplevel tracking. Real
++     * teardown happens only in wayland_client_surface_destroy. The caller
++     * either re-attaches to the same toplevel (no-op below) or to a
++     * different one (real destroy+recreate path). */
++    if (!toplevel) return;
+ 
+     if (!(toplevel_data = wayland_win_data_get_nolock(toplevel)) || !(surface = toplevel_data->wayland_surface))
+     {
+@@ -1403,7 +1426,14 @@
+ 
+     if (client->toplevel != toplevel)
+     {
+-        wayland_client_surface_attach(client, NULL);
++        /* Real toplevel change - must move the subsurface to a new parent.
++         * Destroy old one (different parent), create fresh. Don't recurse
++         * into attach(NULL) - that path now soft-hides only. */
++        if (client->wl_subsurface)
++        {
++            wl_subsurface_destroy(client->wl_subsurface);
++            client->wl_subsurface = NULL;
++        }
+ 
+         client->wl_subsurface =
+             wl_subcompositor_get_subsurface(process_wayland.wl_subcompositor,
+@@ -1419,6 +1449,9 @@
+ 
+         client->toplevel = toplevel;
+     }
++    /* If client->toplevel == toplevel AND wl_subsurface already exists,
++     * we just reconfigure position/size below - no destroy, no recreate,
++     * no stack-order shuffle. */
+ 
+     NtUserGetClientRect(hwnd, &client_rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
+     NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&client_rect, 2, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));

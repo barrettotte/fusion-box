@@ -1,0 +1,181 @@
+# fusion-box wine patch 0004
+# Multi-monitor coordinate fix - make wine report correct per-monitor positions
+# AND keep the primary output anchored at (0,0) so Win32 apps + DXVK don't trip.
+#
+# Bug observed in wine 11.10:
+# Three interlocking bugs make winewayland.drv's multi-monitor output unusable
+# for Win32 apps that place windows/popups via absolute screen coordinates:
+#
+# A. dlls/win32u/sysparams.c:2191 - `add_modes()` does
+#        physical = modes_count == 1 ? *modes : *current;
+#    Wayland compositors typically advertise a single native mode per output
+#    (KWin's norm under Plasma 6). winewayland.drv fills `current` with the
+#    position-bearing physical mode and stuffs the position-less list of
+#    supported modes into `modes[]`. When modes_count==1, win32u takes
+#    *modes (position == 0,0) instead of *current, silently dropping the
+#    position. Result: `source->physical.dmPosition` stays (0,0) for every
+#    monitor, `monitor_get_rect()` reconstructs all rcMonitor rectangles at
+#    the origin, `SM_CXVIRTUALSCREEN` collapses to a single monitor's width.
+#
+# B. dlls/winewayland.drv/display.c:output_info_array_arrange_physical_coords
+#    KWin's coordinate space doesn't anchor at (0,0) for arbitrary
+#    multi-monitor layouts (e.g. on the reporter's 5-monitor setup the
+#    leftmost logical position is (0,1080)). Fixing (A) above without (B)
+#    deterministically crashes DXVK Vulkan init with a page fault in
+#    convert_to_16 -> get_dib_color_table (win32u/dibdrv/primitives.c:3427)
+#    when source->physical.dmPosition of the primary is non-zero. Some wine
+#    GDI/DIB path downstream of set_winstation_monitors makes invalid
+#    assumptions when primary-at-non-(0,0); the symptom is a dib_info
+#    struct with an uninitialised color_table pointer that fires under any
+#    8bpp DIB conversion DXVK happens to trigger during instance setup.
+#    Shifting all output positions so the primary lands at (0,0) is the
+#    Windows convention and avoids the crash entirely.
+#
+# C. dlls/winewayland.drv/display.c:output_info_cmp_primary_x_y picks the
+#    "primary" output by checking `x == 0 && y == 0`. On layouts where no
+#    output is at the origin (common with multi-monitor setups), the
+#    leftmost-by-coord output wins by accident - typically a low-resolution
+#    side display, not the user's actual primary. With (B)'s shift, the
+#    SHIFT-target follows whichever output we flag primary, so picking the
+#    wrong one cascades into maximize / resize / drag breakage (window
+#    operations are sized for the wrong monitor and KWin disagrees with
+#    wine over the title bar drag). Fall back to largest-pixel-count when
+#    no output is at the origin: a compositor-agnostic heuristic that
+#    matches the user's actual primary on real desktops.
+#
+# Empirical reproducer: Autodesk Fusion 360 under wine 11.10 + winewayland.drv
+# on KDE Plasma 6 with multiple connected outputs none of which are at the
+# KWin logical-coordinate origin (0,0). Without this patch:
+#   - CREATE / MODIFY / and other ribbon dropdowns render at off-screen
+#     positions or not at all (popup screen-coords don't line up with main
+#     window screen-coords).
+#   - Ribbon hover registers only over a sub-rectangle of icons; the
+#     boundary shifts with window size ("resolution-dependent dead zones").
+#   - Viewport is cropped to a sub-rectangle of the window.
+#   - SM_CXSCREEN reports wrong size, Fusion launches with a window sized
+#     for the wrong monitor.
+#   - Maximize sizes the window to the wrong monitor, edge-resize handles
+#     are broken, title bar drag doesn't move the window.
+#   - Ribbon hover-highlight flickers at sizes that don't match primary.
+#
+# Fix (three parts, all must ship together):
+#   1. In win32u/sysparams.c, preserve `current->dmPosition` onto
+#      `physical` even when modes_count==1.
+#   2. In winewayland.drv/display.c output_info_cmp_primary_x_y, fall back
+#      to largest-pixel-count when no output is anchored at the origin.
+#   3. In winewayland.drv/display.c output_info_array_arrange_physical_coords,
+#      after sorting outputs (so the primary is first), shift every
+#      output's physical coords by the primary's offset so the primary
+#      always lands at (0,0). Non-primary monitors land at relative
+#      positions, potentially with negative coordinates (matches the
+#      Windows convention; SM_XVIRTUALSCREEN and SM_YVIRTUALSCREEN can be
+#      negative).
+#
+# Status: verified 2026-06-07 against Fusion 360 v2703.1.11 on KDE Plasma 6
+# Wayland with 4×1920x1080 + 1×2560x1440 outputs. The 2560x1440 Acer ends
+# up correctly flagged primary at (0,0). Unblocks: CREATE dropdown
+# rendering, ribbon hover at all window sizes, viewport sizing, sketch
+# palette positioning, window maximize/edge-resize/title-bar drag, ribbon
+# hover-highlight stability.
+#
+# Known remaining issues post-patch:
+#   - Horizontal resize leaves visible "echo" artifacts during drag (likely
+#     subsurface buffer not invalidated promptly - investigation pending).
+#   - Object Browser dock disappears specifically when window is maximized
+#     (subsurface stacking; see fusion-box memory project_overlapping_children_pattern).
+#   - Bottom toolbar still missing in maximized layout (same root cause).
+#
+# Source-of-truth snapshots retained at
+# wine-patches/scratch/checkpoint-multimon/.
+#
+# Author: fusion-box (claude-code session, with Barrett Otte)
+#
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -2189,6 +2189,13 @@
+     }
+ 
+     physical = modes_count == 1 ? *modes : *current;
++    /* fusion-box: preserve position info from `current` even when there's
++     * only one mode (the common wayland case). See task #1. */
++    if (current->dmFields & DM_POSITION)
++    {
++        physical.dmPosition = current->dmPosition;
++        physical.dmFields |= DM_POSITION;
++    }
+     if (ctx->is_primary) ctx->primary = *current;
+ 
+     detached.dmPelsWidth = 0;
+--- a/dlls/winewayland.drv/display.c
++++ b/dlls/winewayland.drv/display.c
+@@ -41,15 +41,37 @@
+     struct wayland_output_state *output;
+ };
+ 
++/* fusion-box: pixel count of an output's current mode, used as a fallback
++ * primary heuristic when no output is anchored at the (0,0) origin. */
++static unsigned long output_info_pixels(const struct output_info *info)
++{
++    if (!info->output->current_mode) return 0;
++    return (unsigned long)info->output->current_mode->width *
++           (unsigned long)info->output->current_mode->height;
++}
++
+ static int output_info_cmp_primary_x_y(const void *va, const void *vb)
+ {
+     const struct output_info *a = va;
+     const struct output_info *b = vb;
+-    BOOL a_is_primary = a->x == 0 && a->y == 0;
+-    BOOL b_is_primary = b->x == 0 && b->y == 0;
+-
+-    if (a_is_primary && !b_is_primary) return -1;
+-    if (!a_is_primary && b_is_primary) return 1;
++    /* fusion-box: original heuristic was just `x == 0 && y == 0`. That works
++     * on simple layouts where the user's primary is anchored at the origin,
++     * but breaks on multi-monitor setups where KWin's coord space doesn't
++     * start at (0,0). Fall back to largest-pixel-count: on real desktops
++     * the user's "primary" is almost always their highest-resolution
++     * display. Compositor-agnostic; no KDE/GNOME-specific protocol binding
++     * required. After this sort, output_info_array_arrange_physical_coords
++     * shifts every output so the first (true primary) lands at (0,0). */
++    BOOL a_is_origin = (a->x == 0 && a->y == 0);
++    BOOL b_is_origin = (b->x == 0 && b->y == 0);
++    if (a_is_origin && !b_is_origin) return -1;
++    if (!a_is_origin && b_is_origin) return 1;
++    if (!a_is_origin && !b_is_origin)
++    {
++        unsigned long ap = output_info_pixels(a), bp = output_info_pixels(b);
++        if (ap > bp) return -1;
++        if (ap < bp) return 1;
++    }
+     if (a->x < b->x) return -1;
+     if (a->x > b->x) return 1;
+     if (a->y < b->y) return -1;
+@@ -183,6 +205,27 @@
+      * to right, but ensure the primary output is first. */
+     qsort(output_info_array->data, num_outputs, sizeof(struct output_info),
+           output_info_cmp_primary_x_y);
++
++    /* fusion-box: after sort, output_info_array[0] is the primary. Shift
++     * every output's physical coords so the primary lands at (0,0) - the
++     * Windows convention that win32u and most Win32 apps assume. KWin's
++     * coordinate space doesn't anchor at (0,0) for arbitrary multi-monitor
++     * layouts, so without this shift the primary can sit at e.g. (0,1080)
++     * and the rest of wine (and DXVK) hits paths that break in obscure
++     * ways. */
++    if (num_outputs > 0)
++    {
++        struct output_info *first = output_info_array->data;
++        int dx = first->x, dy = first->y;
++        if (dx || dy)
++        {
++            wl_array_for_each(info, output_info_array)
++            {
++                info->x -= dx;
++                info->y -= dy;
++            }
++        }
++    }
+ }
+ 
+ static void wayland_add_device_gpu(const struct gdi_device_manager *device_manager,

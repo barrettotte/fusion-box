@@ -1,0 +1,11 @@
+tmp/
+
+__pycache__/
+*.pyc
+
+*.dll
+*.so
+*.exe.so
+
+# Diagnostic captures
+debug/captures/
