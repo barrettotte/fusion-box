@@ -33,24 +33,42 @@ XWayland with a per-app override:
   bar clicks. Without it KDE Plasma 6 draws decoration on top of wine's surface
   and clicks at the edge are eaten by KWin-as-resize.
 - `wine-patches/0002-...` (stop `wl_subsurface_place_above` thrash in
-  `reconfigure_subsurface`) - restored visibility of bottom toolbar, comments
-  panel, and ribbon tooltips. Per Wayland spec, `place_above(sub, parent)` puts
-  `sub` IMMEDIATELY above the reference in the substack; multiple siblings all
-  re-asserting against the same anchor on every frame meant only the
-  last-called sibling stayed topmost.
-- `wine-patches/0003-...` (xdg_popup support) - CREATE dropdown, extrude menu,
+  `reconfigure_{client,subsurface}`) - restored visibility of bottom toolbar,
+  comments panel, ribbon tooltips, splash dismissal, object browser stability.
+  Per Wayland spec, `place_above(sub, parent)` puts `sub` IMMEDIATELY above
+  the reference in the substack; multiple siblings all re-asserting against
+  the same anchor on every frame meant only the last-called sibling stayed
+  topmost. **Verified safe and load-bearing 2026-06-09.**
+- `wine-patches/0003-...` (keep client subsurface alive across detach) -
+  **verified 2026-06-09.** Half A: skips wine's destroy-on-soft-detach in
+  `wayland_client_surface_attach`, preserving sibling z-order across
+  focus/configure cycles. Half B: walks the wayland_win_data rb tree at
+  `wayland_surface_destroy` time to tear down any client subsurfaces
+  whose parent toplevel is dying, avoiding the `wl_subsurface error 0:
+  no parent` KWin termination Fusion's comment-menu dismiss originally
+  triggered. Originally bundled with 0002; split out 2026-06-09.
+- `wine-patches/0004-...` (xdg_popup support) - CREATE dropdown, extrude menu,
   ribbon tooltips, sketch palette. WS_POPUP-with-owner windows now create an
   xdg_popup anchored to the owner's xdg_surface; without this they were
   free-floating xdg_toplevels that KWin placed arbitrarily. The patch also
   relaxes the WS_EX_LAYERED-without-attribs visibility gate for WS_POPUP (Qt6
   marks QMenu/tooltips layered for drop-shadow without ever calling
   SetLayeredWindowAttributes).
-- `wine-patches/0004-...` (multimon coord fix) - fixed CREATE menu position,
+- `wine-patches/0005-...` (multimon coord fix) - fixed CREATE menu position,
   resolution-dependent ribbon click/hover dead zones, sketch palette cropping,
   viewport edge-resize cursor zones. Root cause was `wayland_add_device_modes`
   not stamping `dmPosition` on the modes array, so `win32u/sysparams.c`'s
   `physical = *modes` collapsed all monitor geometry to (0,0). Same bug class
   as winex11.drv's 2019 fix (commit `23b28323cb`, bug #37709).
+- `wine-patches/0006-...` (virtual subsurface for occluded Qt6 WS_CHILD widgets)
+  - **fixed the nav toolbar burial** documented in `docs/bottom-toolbar-burial.md`.
+  The center-bottom navigation toolbar (orbit/pan/zoom/fit) is a Qt6
+  WS_CHILD widget that paints into main's GDI buffer; sibling DXVK widgets
+  present through their own wl_subsurfaces and bury it. Patch synthesizes a
+  wl_subsurface for the toolbar (small WS_CHILD with no client_surface),
+  attaches main's GDI buffer to it with a wp_viewport_set_source crop on
+  every parent commit. Same buffer-extraction pattern Qt6's own native
+  QtWaylandClient platform uses. Verified 2026-06-09 on Fusion 360.
 - Sign-in pipeline (`adskidmgr://` callback -> IDM token exchange) - works
   end-to-end via a host browser MIME handler; see `scripts/adskidmgr-handler.sh`
   (registered by `scripts/install-host-handler.sh`).
@@ -208,9 +226,9 @@ Listed so future sessions don't loop through them again.
 ### Multi-monitor / display enum
 
 - **One-line `dmPosition` stamp in `wayland_add_device_modes`** (the clean
-  version of patch 0004) - caused an OOM during Fusion startup
+  version of patch 0005) - caused an OOM during Fusion startup
   (`err:virtual:map_view anon mmap error Cannot allocate memory, size
-  0x6ffff0700000`). Patch 0004 takes a more elaborate route (preserve position
+  0x6ffff0700000`). Patch 0005 takes a more elaborate route (preserve position
   in primary-shift path) that avoids the OOM.
 
 ## Reference - upstream wine MRs touched on

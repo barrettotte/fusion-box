@@ -1,4 +1,5 @@
-# fusion-box wine patch 0003
+# fusion-box wine patch 0004
+# (renumbered from 0003 on 2026-06-09 when patch 0002 was split into 0002+0003)
 # Add xdg_popup support to winewayland.drv for WS_POPUP windows with an owner.
 #
 # Bug observed in wine 11.10:

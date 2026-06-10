@@ -95,13 +95,16 @@ See `docs/observed-issues.md` for full diagnosis, attempted-but-failed fixes, an
 ## TODO
 
 - Investigate Qt6-side fix for the navigation toolbar root cause (per `docs/bottom-toolbar-burial.md`)
+- progress bars for install/build or more logging for user feedback
+- combine `build-wine.sh` and `build-wine-fast.sh`, use a `--fast` flag
 - use `COPY` for repo instead of symlinked reference
+
+Tests:
 - Test general CAD workflows
 - Test CAM samples
 - Test Electronics samples
 - Test Design samples
 - Test Generative Design samples
-- Screenshots / documentation
 
 ## Attribution
 

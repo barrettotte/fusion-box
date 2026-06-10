@@ -1,0 +1,404 @@
+# fusion-box wine patch 0006
+# Virtual subsurface for Qt6 WS_CHILD widgets that paint into the toplevel's
+# GDI buffer ("GDI-buffer slice promotion").
+#
+# Bug:
+# Fusion 360's center-bottom navigation toolbar (orbit/pan/zoom/fit/etc.) is a
+# Qt6 WS_CHILD widget (`Qt683QWindowIcon`) that paints its pixels into the
+# parent toplevel's GDI window_surface - it does NOT own a DXVK swapchain.
+# Sibling Qt6 widgets (the modeling viewport, ribbon, etc.) DO own DXVK
+# swapchains, each presented through its own `wayland_client_surface`
+# attached as a sibling subsurface of the main toplevel. Per the Wayland
+# subsurface protocol, the parent's buffer is always at the BOTTOM of the
+# composite tree - every subsurface renders above it. The nav toolbar's
+# pixels live in main's buffer, so they're inherently underneath the
+# viewport's white swapchain. No subsurface z-order shuffle among main's
+# siblings can lift main's own buffer above its children.
+#
+# This was previously documented in docs/observed-issues.md as "no
+# winewayland.drv-only fix exists" - the Qt6 paint-target / DXVK
+# render-target architectural mismatch. See docs/bottom-toolbar-burial.md
+# for the full investigation.
+#
+# Fix (Path 2 from bottom-toolbar-burial.md, "GDI-buffer slice promotion"):
+# For each Qt6 WS_CHILD widget that (a) is visible with a non-empty rect,
+# (b) is small enough to be toolbar-like (h<=50, w<=1000), (c) does NOT own
+# its own client_surface, and (d) lives under a TOPLEVEL-role
+# wayland_surface, synthesize a wl_subsurface attached to the toplevel.
+# This "virtual" subsurface owns no buffer of its own; on every parent GDI
+# commit, attach the parent's wl_buffer to the virtual subsurface with a
+# wp_viewport_set_source crop matching the child's screen-rect-within-
+# toplevel. The virtual subsurface lands above sibling DXVK
+# client_subsurfaces by Wayland creation-order rule, so the cropped toolbar
+# pixels render on top.
+#
+# Why this works architecturally:
+# Qt6's own native QtWaylandClient platform plugin uses exactly this pattern:
+# it extracts sub-rects from a parent's SHM backing buffer and presents
+# them through the child's own wl_subsurface
+# (qtbase/src/plugins/platforms/wayland/qwaylandshmbackingstore.cpp:301-316).
+# When Qt runs under wine + winewayland, however, Qt's *Win32* QPA plugin
+# (qwindows.dll) doesn't request per-WS_CHILD GDI window_surfaces - children
+# share the parent's HDC. Wine's gate at window.c:583 (the `if (!surface)`
+# branch in WAYLAND_WindowPosChanged) destroys any existing wayland_surface
+# when win32u passes a NULL window_surface, and short-circuits before
+# wayland_win_data_create_wayland_surface ever fires. So no wayland_surface
+# ever exists for the nav toolbar's HWND.
+#
+# Empirical verification of the underlying primitive (2026-06-09):
+# debug/wine-tests/shared-buffer-test/ - a pure wayland-client program (no
+# wine) that exercises "parent SHM buffer + N viewport-cropped subsurfaces
+# + opaque sibling subsurface between them". KDE Plasma 6 KWin composites
+# this arrangement correctly on NVIDIA Open driver 610.43.02.
+#
+# Empirical verification on Fusion 360 (2026-06-09):
+# Nav toolbar renders at correct position over the modeling viewport.
+# Hover triggers tooltips (input passes through to Win32 via the empty
+# input region on the virtual subsurface). Clicks open submenus correctly.
+# Works across window resize/move (the commit hook recomputes the
+# child-local rect on every parent commit).
+#
+# Strictness of the gate (deliberately restrictive - earlier permissive
+# version over-created subsurfaces for every visible WS_CHILD and broke
+# the UI):
+#   - HWND has WS_CHILD style.
+#   - HWND is visible (WS_VISIBLE) with non-zero rect.
+#   - data->client_surface == NULL (no DXVK swapchain of its own).
+#   - HWND's rect is "toolbar-like": height <= 50, width <= 1000.
+#     (Fusion's nav toolbar is 239x24. Full-content panels are excluded.)
+#   - Toplevel ancestor's wayland_surface exists with TOPLEVEL role and
+#     valid wl_surface (so the wl_subsurface_get_subsurface call won't
+#     fail with "no parent").
+#
+# Open work / future refinements:
+#   - Empty input region means clicks fall through to the toplevel's
+#     wl_surface, which wine then routes to the correct child HWND via
+#     win32 cursor coords. Works in practice; cursor-shape updates on
+#     hover are missing (separate bug class, not in scope).
+#   - The size gate is a heuristic. A future revision should base it on
+#     "overlaps a sibling whose client_surface is non-NULL" instead -
+#     more principled, less risk of false positive on similarly-sized
+#     widgets that don't need promotion.
+#   - The commit hook fires on every parent GDI flush. For widgets whose
+#     rect hasn't changed, the position+viewport+attach sequence is
+#     mostly redundant. Cheap to skip if needed.
+#
+# Apply from the wine source root: `patch -p1 < this-file`. Depends on
+# patches 0001-0005 (line offsets assume all five are applied).
+#
+# Author: fusion-box (claude-code session, with Barrett Otte)
+#
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -401,13 +401,24 @@
+     BOOL is_fullscreen;
+     BOOL managed;
+     BOOL layered_attribs_set;
++    /* fusion-box (patch 0006): when TRUE, wayland_surface is a "virtual" subsurface
++     * that does not own its own wl_buffer. The toplevel's GDI buffer is attached to
++     * this surface via a wp_viewport_set_source crop matching the child's rect, so
++     * it surfaces above sibling DXVK client_subsurfaces that would otherwise bury
++     * Qt6 WS_CHILD widgets painted into the toplevel's GDI. See
++     * docs/bottom-toolbar-burial.md "2026-06-09 - Step 0 result: PASS". */
++    BOOL virtual_buffer;
++    /* fusion-box (patch 0006): toplevel HWND this virtual_buffer subsurface is
++     * attached to. Cached so set_window_surface_contents can find virtual
++     * subsurface children of a given toplevel without walking the Win32 tree. */
++    HWND virtual_toplevel;
+ };
+ 
+ struct wayland_win_data *wayland_win_data_get(HWND hwnd);
+ struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd);
+ void wayland_win_data_release(struct wayland_win_data *data);
+-/* fusion-box (patch 0003): walk the rb tree and tear down any client
+- * wl_subsurfaces whose toplevel matches `toplevel`. Called from
++/* fusion-box (patch 0003 follow-up): walk the rb tree and tear down any
++ * client wl_subsurfaces whose toplevel matches `toplevel`. Called from
+  * wayland_surface_destroy on a TOPLEVEL/POPUP wayland_surface to avoid
+  * leaving child subsurfaces orphaned when their parent wl_surface dies. */
+ void detach_client_subsurfaces_for_toplevel(HWND toplevel);
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -640,15 +640,134 @@
+                 wayland_client_surface_attach(client, NULL);
+         }
+ 
+-        if (data->wayland_surface)
++        /* fusion-box patch 0005: virtual subsurface eligibility.
++         *
++         * Qt6 WS_CHILD widgets that paint into their parent's GDI (instead of
++         * owning their own DXVK swapchain) end up buried behind sibling
++         * DXVK-bearing wl_subsurfaces of the toplevel - main's GDI buffer
++         * (where Qt painted the child's pixels) is at the BOTTOM of the
++         * subsurface tree by Wayland protocol, and no z-order shuffle among
++         * main's siblings can lift it. See docs/bottom-toolbar-burial.md.
++         *
++         * The fix: synthesize a wl_subsurface for the child even though it
++         * has no GDI window_surface of its own ("virtual_buffer"). At
++         * set_window_surface_contents time we'll attach the toplevel's
++         * shm_buffer to this child surface with a wp_viewport src crop
++         * matching the child's screen-rect-within-toplevel. The virtual
++         * subsurface lands above DXVK siblings by Wayland creation-order
++         * rule.
++         *
++         * Gate (strict - earlier permissive version was a wreck: created
++         * subsurfaces for the RHI viewport widget itself (which has its
++         * own DXVK swapchain via data->client_surface), the ribbon panel
++         * (huge area, intercepted clicks), etc. Triggered KWin protocol
++         * errors and ~total UI brokenness. Verified on Fusion 2026-06-09.):
++         *
++         *   - HWND is a WS_CHILD (Qt6 child widget)
++         *   - Visible (style & WS_VISIBLE) and non-empty rect
++         *   - Has a toplevel ancestor whose wayland_surface is TOPLEVEL role
++         *     (xdg_toplevel exists - required for the subsurface parent)
++         *   - Has NO client_surface of its own (i.e., no DXVK swapchain;
++         *     widgets with DXVK already present their own pixels via the
++         *     existing client_surface_attach path - virtual promotion
++         *     would create a competing surface)
++         *   - Rect is "toolbar-like": height <= 50, width <= 1000. Fusion's
++         *     nav toolbar is 239x24. This excludes full-content panels
++         *     (viewport widget 2554x1195, ribbon area, side panels).
++         *
++         * If gate passes: create the wayland_surface as SUBSURFACE role
++         * (or reuse if already there) and flag virtual_buffer=TRUE.
++         * Otherwise fall through to the original destroy. */
+         {
+-            wayland_surface_destroy(data->wayland_surface);
+-            data->wayland_surface = NULL;
++            DWORD style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
++            BOOL visible = (style & WS_VISIBLE) == WS_VISIBLE;
++            int w = data->rects.window.right - data->rects.window.left;
++            int h = data->rects.window.bottom - data->rects.window.top;
++            BOOL eligible =
++                toplevel_surface &&
++                toplevel_surface->wl_surface &&
++                toplevel_surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
++                (style & WS_CHILD) && visible &&
++                w > 0 && h > 0 && h <= 50 && w <= 1000 &&
++                !data->client_surface;
++
++            /* fusion-box-vsub instrumentation: log the decision and the
++             * reason, so failed launches are easy to diagnose. Upgraded
++             * to ERR so default WINEDEBUG=fixme-all,err-winediag sees it. */
++            TRACE("[fusion-box-vsub] decide hwnd=%p toplevel=%p style=0x%lx vis=%d w=%d h=%d "
++                "client_surf=%p toplevel_surf=%p tl_role=%d eligible=%d\n",
++                hwnd, toplevel, (long)style, visible, w, h,
++                data->client_surface, toplevel_surface,
++                toplevel_surface ? toplevel_surface->role : -1,
++                eligible);
++
++            if (eligible)
++            {
++                struct wayland_surface *vs = data->wayland_surface;
++                if (!vs)
++                {
++                    vs = wayland_surface_create(hwnd);
++                    if (!vs)
++                        TRACE("[fusion-box-vsub] wayland_surface_create FAILED hwnd=%p\n", hwnd);
++                }
++                if (vs)
++                {
++                    data->wayland_surface = vs;
++                    if (vs->role != WAYLAND_SURFACE_ROLE_SUBSURFACE)
++                    {
++                        TRACE("[fusion-box-vsub] make_subsurface hwnd=%p vs=%p parent_surf=%p\n",
++                            hwnd, vs, toplevel_surface);
++                        wayland_surface_make_subsurface(vs, toplevel_surface);
++                    }
++                    if (vs->wl_subsurface)
++                    {
++                        /* Empty input region: pointer events at the toolbar's screen
++                         * coords fall through to the toplevel's wl_surface where wine's
++                         * existing Win32 routing handles them. Without this, the
++                         * subsurface claims input by default but we have no handler,
++                         * so clicks and hovers are dropped. */
++                        struct wl_region *empty = wl_compositor_create_region(process_wayland.wl_compositor);
++                        if (empty)
++                        {
++                            wl_surface_set_input_region(vs->wl_surface, empty);
++                            wl_region_destroy(empty);
++                        }
++
++                        data->virtual_buffer = TRUE;
++                        data->virtual_toplevel = toplevel;
++                        TRACE("[fusion-box-vsub] CREATED hwnd=%p toplevel=%p wl_subsurface_id=%u rect=(%ld,%ld %dx%d) input=empty\n",
++                            hwnd, toplevel,
++                            wl_proxy_get_id((struct wl_proxy *)vs->wl_subsurface),
++                            data->rects.window.left, data->rects.window.top,
++                            w, h);
++                    }
++                    else
++                    {
++                        TRACE("[fusion-box-vsub] make_subsurface left wl_subsurface=NULL, tearing down hwnd=%p\n", hwnd);
++                        wayland_surface_destroy(vs);
++                        data->wayland_surface = NULL;
++                        data->virtual_buffer = FALSE;
++                        data->virtual_toplevel = NULL;
++                    }
++                }
++            }
++            else if (data->wayland_surface)
++            {
++                TRACE("[fusion-box-vsub] destroy (no longer eligible) hwnd=%p\n", hwnd);
++                wayland_surface_destroy(data->wayland_surface);
++                data->wayland_surface = NULL;
++                data->virtual_buffer = FALSE;
++                data->virtual_toplevel = NULL;
++            }
+         }
+     }
+     else if (wayland_win_data_create_wayland_surface(data, toplevel_surface))
+     {
+         wayland_win_data_update_wayland_state(data);
++        /* fusion-box patch 0005: real GDI-backed surface now exists, so this
++         * HWND is no longer a virtual_buffer candidate. */
++        data->virtual_buffer = FALSE;
++        data->virtual_toplevel = NULL;
+     }
+ 
+     wayland_win_data_release(data);
+@@ -1015,7 +1134,7 @@
+ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region)
+ {
+     struct wayland_surface *wayland_surface;
+-    struct wayland_win_data *data;
++    struct wayland_win_data *data, *child;
+     BOOL committed = FALSE;
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+@@ -1034,6 +1153,135 @@
+         }
+     }
+ 
++    /* fusion-box patch 0005: after the toplevel commits its GDI buffer, walk
++     * the rb tree for virtual_buffer children whose virtual_toplevel == hwnd.
++     * For each, re-attach the toplevel's shm_buffer to the child's wl_surface
++     * with wp_viewport_set_source cropped to the child's screen-rect-within-
++     * toplevel, then commit the child. Mutex is held throughout (we're
++     * inside wayland_win_data_get's lock); rb_tree iteration is safe.
++     *
++     * We use screen rects (NtUserGetWindowRect) and subtract the toplevel's
++     * screen rect to get the toplevel-local rect - data->rects.window is
++     * relative to the immediate parent's client area, which for deeply
++     * nested WS_CHILDren isn't the toplevel.
++     *
++     * If only `committed` is TRUE we have a fresh shm_buffer attached; if
++     * not, the toplevel itself wasn't ready, and re-attaching to children
++     * would race. Skip in that case. */
++    if (committed)
++    {
++        RECT toplevel_rect;
++        int seen = 0, committed_vsubs = 0, skipped = 0;
++        /* Capture toplevel parent surface for defensive parent-still-alive check.
++         * `wayland_surface` (the toplevel's surface) was confirmed non-NULL above
++         * (we're in the committed=TRUE branch which required data->wayland_surface).
++         * If its role isn't TOPLEVEL anymore (e.g., Fusion popup opened and wine
++         * temporarily reassigned), our subsurfaces are dangling - tear them down
++         * instead of operating on them (would trigger KWin's "no parent" error and
++         * kill the process). */
++        struct wayland_surface *parent_surf = wayland_surface;
++        BOOL parent_ok = parent_surf && parent_surf->wl_surface &&
++                         parent_surf->role == WAYLAND_SURFACE_ROLE_TOPLEVEL;
++        if (NtUserGetWindowRect(hwnd, &toplevel_rect, 0))
++        {
++            RB_FOR_EACH_ENTRY(child, &win_data_rb, struct wayland_win_data, entry)
++            {
++                struct wayland_surface *cs;
++                RECT child_screen, child_local;
++                int sx, sy, sw, sh;
++
++                if (!child->virtual_buffer) continue;
++                if (child->virtual_toplevel != hwnd) continue;
++                seen++;
++
++                /* Tear down if parent isn't a valid TOPLEVEL anymore. The wl_subsurface
++                 * holds a reference to a parent wl_surface that may have been destroyed;
++                 * any wire-level operation on it would trigger KWin's "no parent" error. */
++                if (!parent_ok)
++                {
++                    TRACE("[fusion-box-vsub] tearing down hwnd=%p: parent_surf=%p role=%d wl_surface=%p\n",
++                        child->hwnd, parent_surf,
++                        parent_surf ? parent_surf->role : -1,
++                        parent_surf ? parent_surf->wl_surface : NULL);
++                    if (child->wayland_surface)
++                    {
++                        wayland_surface_destroy(child->wayland_surface);
++                        child->wayland_surface = NULL;
++                    }
++                    child->virtual_buffer = FALSE;
++                    child->virtual_toplevel = NULL;
++                    skipped++;
++                    continue;
++                }
++
++                if (!(cs = child->wayland_surface))
++                {
++                    TRACE("[fusion-box-vsub] commit skip hwnd=%p: no wayland_surface\n", child->hwnd);
++                    skipped++; continue;
++                }
++                if (cs->role != WAYLAND_SURFACE_ROLE_SUBSURFACE)
++                {
++                    TRACE("[fusion-box-vsub] commit skip hwnd=%p: role=%d (not SUBSURFACE)\n",
++                        child->hwnd, cs->role);
++                    skipped++; continue;
++                }
++                if (!cs->wl_subsurface || !cs->wp_viewport)
++                {
++                    TRACE("[fusion-box-vsub] commit skip hwnd=%p: wl_subsurface=%p wp_viewport=%p\n",
++                        child->hwnd, cs->wl_subsurface, cs->wp_viewport);
++                    skipped++; continue;
++                }
++
++                if (!NtUserGetWindowRect(child->hwnd, &child_screen, 0))
++                {
++                    TRACE("[fusion-box-vsub] commit skip hwnd=%p: NtUserGetWindowRect failed\n", child->hwnd);
++                    skipped++; continue;
++                }
++                child_local.left   = child_screen.left   - toplevel_rect.left;
++                child_local.top    = child_screen.top    - toplevel_rect.top;
++                child_local.right  = child_screen.right  - toplevel_rect.left;
++                child_local.bottom = child_screen.bottom - toplevel_rect.top;
++
++                sx = child_local.left;
++                sy = child_local.top;
++                sw = child_local.right  - child_local.left;
++                sh = child_local.bottom - child_local.top;
++                if (sw <= 0 || sh <= 0 || sx < 0 || sy < 0 ||
++                    sx + sw > shm_buffer->width || sy + sh > shm_buffer->height)
++                {
++                    TRACE("[fusion-box-vsub] commit skip hwnd=%p: out-of-bounds local=(%d,%d %dx%d) buf=%dx%d\n",
++                        child->hwnd, sx, sy, sw, sh, shm_buffer->width, shm_buffer->height);
++                    skipped++; continue;
++                }
++
++                TRACE("[fusion-box-vsub] commit hwnd=%p wl_subsurface_id=%u src=(%d,%d %dx%d) buf=%dx%d\n",
++                    child->hwnd,
++                    wl_proxy_get_id((struct wl_proxy *)cs->wl_subsurface),
++                    sx, sy, sw, sh, shm_buffer->width, shm_buffer->height);
++
++                wl_subsurface_set_position(cs->wl_subsurface, sx, sy);
++                wp_viewport_set_source(cs->wp_viewport,
++                                       wl_fixed_from_int(sx),
++                                       wl_fixed_from_int(sy),
++                                       wl_fixed_from_int(sw),
++                                       wl_fixed_from_int(sh));
++                wp_viewport_set_destination(cs->wp_viewport, sw, sh);
++                wl_surface_attach(cs->wl_surface, shm_buffer->wl_buffer, 0, 0);
++                wl_surface_damage_buffer(cs->wl_surface, 0, 0, sw, sh);
++                wl_surface_commit(cs->wl_surface);
++                committed_vsubs++;
++            }
++            if (seen > 0)
++                TRACE("[fusion-box-vsub] parent_commit hwnd=%p seen=%d committed=%d skipped=%d\n",
++                    hwnd, seen, committed_vsubs, skipped);
++            wl_display_flush(process_wayland.wl_display);
++        }
++        else
++        {
++            TRACE("[fusion-box-vsub] parent_commit hwnd=%p: NtUserGetWindowRect(toplevel) failed\n", hwnd);
++        }
++    }
++
+     /* Update the latest window buffer for the wayland surface. Note that we
+      * only care whether the buffer contains the latest window contents,
+      * it's irrelevant if it was actually committed or not. */

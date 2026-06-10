@@ -8,6 +8,25 @@ Cross-reference: the umbrella view of all Fusion-on-wayland symptoms lives in
 `docs/observed-issues.md`. This doc focuses on **only** the bottom-toolbar burial
 and intentionally narrows scope so it stays usable.
 
+> ## 🔢 Patch numbering note (2026-06-09)
+>
+> Older sessions in this doc reference the OLD patch numbering:
+>   - old 0002 = place_above thrash removal + destroy-skip (bundled)
+>   - old 0003 = xdg_popup support
+>   - old 0004 = multimon coord fix
+>   - old "patch 0005" (this doc, prior virtual-subsurface WIP discussions)
+>
+> On 2026-06-09 patch 0002 was split:
+>   - new 0002 = place_above thrash removal only (verified)
+>   - new 0003 = destroy-skip only (WIP/suspect, causes comment-menu crash)
+>   - new 0004 = xdg_popup support (renumbered from 0003)
+>   - new 0005 = multimon coord fix (renumbered from 0004)
+>   - the virtual-subsurface WIP previously called "0005-rev4" is now "0006"
+>     (a future patch number; not yet a real .patch file).
+>
+> Historical sections below predate this split; their patch numbers refer
+> to the OLD scheme.
+
 > ## ⚠ Status (2026-06-08, multiple sessions)
 >
 > **This doc's body is misaimed.** Sections below "## The bug, restated"
@@ -818,3 +837,281 @@ multi-MR redesign of wine's window_surface ↔ wayland_surface coupling.
   composited output, which is what you already see. Doesn't reveal the
   per-surface buffer contents pre-composite. Only `VK_LAYER_LUNARG_screenshot`
   (or renderdoc) sees the per-swapchain pixels.
+
+## 2026-06-09 - Path 2 reassessment (re-scoping the wine fix)
+
+Picking back up. Re-read the architectural verdict, then cross-checked
+against (a) upstream wine post-11.10 (zero commits touching
+`dlls/winewayland.drv/` in the 124-commit window since the 11.10 tag),
+(b) Qt6 native wayland's QtWaylandClient platform plugin, and (c) the
+three codeberg Fusion-on-Linux threads the user pointed at (#311, #557,
+#631). The codeberg threads turned out orthogonal - all on wine 8-9-era
+with auth/install/Direct3D issues, none on the architectural overlap.
+
+The Qt-native investigation flipped my prior on Path 2.
+
+### What Qt6 native wayland actually does
+
+`qtbase/src/plugins/platforms/wayland/qwaylandshmbackingstore.cpp:301-316`
+is the smoking gun. When Qt's wayland QPA plugin flushes a child
+QWidget's backing store:
+
+```cpp
+if (window != this->window()) {
+    auto waylandWindow = static_cast<QWaylandWindow *>(window->handle());
+    const auto scale = waylandWindow->scale();
+    auto newBuffer = new QWaylandShmBuffer(...);
+    newBuffer->setDeleteOnRelease(true);
+    QRect sourceRect(offset * scale, window->size() * scale);
+    QPainter painter(newBuffer->image());
+    painter.drawImage(QPoint(0, 0), *mBackBuffer->image(), sourceRect);
+    waylandWindow->safeCommit(newBuffer, region);
+    return;
+}
+```
+
+Qt **extracts the child widget's sub-rect from the parent's SHM
+backing buffer** into a fresh wl_buffer and presents it through the
+child's own `wl_subsurface`. The decision to give each child its own
+wl_surface is unconditional - `QWaylandWindow::shouldCreateSubSurface()`
+at `qwaylandwindow.cpp:307-310` is literally
+`return QPlatformWindow::parent() != nullptr;` - i.e., every non-toplevel
+QWidget gets its own wl_subsurface.
+
+Qt sets z-order purely by creation order; no `place_above`/`place_below`
+calls appear in QtWaylandClient anywhere.
+
+So the pattern we said was "fundamental architectural rework" is
+literally Qt's normal wayland behavior. The reason wine on
+winewayland.drv doesn't do this for Fusion is structural:
+
+- Qt's Win32 QPA plugin (`qwindows.dll`) doesn't request per-WS_CHILD
+  GDI window_surfaces. Children share the parent's GDI HDC.
+- Wine's gate at `dlls/winewayland.drv/window.c:583` (the `if (!surface)`
+  branch in `WAYLAND_WindowPosChanged`) destroys any existing
+  `wayland_surface` when win32u passes a NULL `window_surface`, and
+  short-circuits before `wayland_win_data_create_wayland_surface` ever
+  fires.
+
+So no wayland_surface ever exists for the nav toolbar's HWND - which is
+exactly what the prior session's probe confirmed empirically.
+
+### What primitives wine already has
+
+All confirmed by reading the cached source at
+`~/.cache/fusion-box/wine-build/wine-11.10/dlls/winewayland.drv/`:
+
+- `wp_viewporter` is bound at startup (`wayland.c:156-159`), with an ERR
+  if missing (`wayland.c:319-321`). Required.
+- Every `wayland_surface` already owns a `wp_viewport`
+  (`waylanddrv.h:257`, created in `wayland_surface_create` at
+  `wayland_surface.c:204-209`).
+- `wp_viewport_set_source` (sub-rect crop) is already used pervasively
+  (`wayland_surface.c:668`).
+- GDI window_surface is backed by normal `wl_shm`-pool buffers
+  (`window_surface.c:57-167`).
+- Multiple `wl_surface`s attaching the same `wl_buffer` is legal per
+  protocol (buffer is reference-counted on attach/release).
+
+Nothing about the primitives Path 2 needs is missing.
+
+### Sketch of the patch (NOT yet a proposal - needs Step 0 verification)
+
+Working name: **Patch 0006 - virtual subsurface for occluded child
+HWNDs (a.k.a. "GDI-buffer slice promotion").** (Originally called
+"0005-rev4" before the 2026-06-09 patch renumbering; multimon is now 0005.)
+
+1. **Trigger gate.** In `WAYLAND_WindowPosChanged` (`window.c:559`), the
+   `!surface` branch (currently destroys wayland_surface): before the
+   destroy, check:
+   - `(style & WS_CHILD)` AND visible AND non-zero rect.
+   - HWND's nearest ancestor with a `wayland_surface` (`toplevel`).
+   - That ancestor has at least one OTHER child HWND whose
+     `data->client_surface` is non-NULL and whose screen rect overlaps
+     this HWND's screen rect.
+   - If all yes: skip the destroy, instead create-or-keep a wayland_surface
+     for this HWND with a new role `WAYLAND_SURFACE_ROLE_VIRTUAL_SUBSURFACE`.
+
+2. **Surface allocation.** New helper
+   `wayland_surface_make_virtual_subsurface(surface, toplevel)` that:
+   - Allocates the `wl_subsurface` against the toplevel's wl_surface.
+   - Sets `wl_subsurface_set_desync` (so it commits independently of
+     the toplevel - actually we want sync, see open question).
+   - Stores the child's local-to-parent offset.
+
+3. **Buffer attach / commit synchronization.** Hook the toplevel's
+   window_surface commit path
+   (`window_surface.c:wayland_window_surface_flush` or equivalent).
+   After committing the toplevel's wl_buffer to main's wl_surface, for
+   each virtual-subsurface child:
+   - `wl_surface_attach(child->wl_surface, parent_buffer, 0, 0)`.
+   - `wp_viewport_set_source(child->wp_viewport, child_rect_x,
+     child_rect_y, child_rect_w, child_rect_h)`.
+   - `wp_viewport_set_destination(child->wp_viewport, child_w,
+     child_h)`.
+   - `wl_surface_damage_buffer(child->wl_surface, 0, 0, w, h)`.
+   - `wl_surface_commit(child->wl_surface)`.
+
+4. **Z-order.** Each new virtual-subsurface lands at the TOP of the
+   toplevel's substack by Wayland creation-order rule, which is exactly
+   what we want. No `place_above`/`place_below` calls needed - matches
+   Qt's pattern.
+
+5. **Teardown.** When the trigger gate stops applying (HWND hidden,
+   moved off-screen, no longer overlapped), destroy the
+   wayland_surface and revert to the existing `!surface` destroy path.
+
+### Step 0 - empirical verification BEFORE writing the patch
+
+There's one piece of runtime behavior I haven't proven from reading
+code: that KWin actually composites the "shared parent wl_buffer +
+wp_viewport cropped per child + child stacked above DXVK siblings"
+arrangement the way protocol implies. Multiple things could break it:
+
+- KWin might require each subsurface have its OWN backing buffer (some
+  implementations do).
+- wp_viewport `set_source` with a fractional sub-rect of a sibling-shared
+  buffer may not be well-tested on KDE.
+- The combination "parent buffer with N viewport-cropped subsurfaces,
+  some buffer-less DXVK swapchain siblings between them" is unusual.
+
+Concrete test program (extending the existing `debug/wine-tests/`
+infrastructure - call it `shared-buffer-test.c`):
+
+- Toplevel xdg_surface with an SHM buffer painted: top half red,
+  bottom-center 100×20 strip black (the "toolbar").
+- Subsurface A (sibling of toplevel): own SHM buffer, solid white,
+  full size of parent. This simulates the DXVK swapchain widget.
+- Subsurface B (sibling of toplevel, created AFTER A so it's on top):
+  attaches the parent's red+black buffer, wp_viewport src cropped to
+  the bottom-center 100×20 "toolbar" region.
+
+Expected: the 100×20 black strip appears centered-bottom over a
+white background. If yes - Path 2 is unblocked. If no - investigate
+why, and adjust the patch sketch accordingly (maybe each child needs
+its own buffer, à la Qt's full extraction).
+
+This test is ~150 lines of C + wayland-client + wl_shm. Standalone, no
+wine dependency. Should run inside fusion-box against the user's KWin
+to test on the real compositor.
+
+### Open questions
+
+1. **Sync vs desync subsurface mode.** Subsurfaces default to sync mode
+   (commits are deferred until parent commits). For our case sync is
+   probably correct - the child's view of the parent's buffer should
+   update atomically with the parent's commit. But sync mode has
+   subtleties with input regions and damage that may matter.
+
+2. **Input region.** The toolbar pixels are clickable. Whose
+   wl_surface should receive `pointer.enter` for those coordinates?
+   By Wayland protocol, it's the topmost surface with a matching input
+   region. We'd want the toolbar's virtual subsurface to claim input
+   for its rect (so Fusion's click handlers fire on the correct HWND),
+   not the DXVK widget below it.
+
+3. **Refresh cadence.** If the parent's buffer doesn't change but the
+   subsurface needs to be re-committed (e.g., we change its position
+   or viewport src), do we incur a redraw of the cropped region? Probably
+   not under KWin (compositor-side optimization), but worth confirming.
+
+4. **WS_CHILD HWNDs that DO have their own GDI surface.** Some Win32
+   apps allocate per-control HDCs and paint into them. Those HWNDs
+   already get a wayland_surface via the existing path. The new gate
+   must not double-allocate.
+
+5. **What happens to wine patches 0002 (place_above thrash removal)
+   and 0003 (xdg_popup)?** Independent of this fix - 0002 stays as-is,
+   0003 only affects popups (different role), unaffected.
+
+### Recommended next concrete action
+
+Build `shared-buffer-test.c` per Step 0. ~1-2h of work. If KWin
+composites it correctly, Path 2 becomes a real implementation target.
+If not, we have hard evidence to file an upstream Qt issue (Path 1) or
+formalize the XWayland workaround as the only viable path (Path 3).
+
+## 2026-06-09 - Step 0 result: PASS
+
+`debug/wine-tests/shared-buffer-test/` built and ran inside fusion-box
+against the user's KDE Plasma 6.6.5 / KWin Wayland session, NVIDIA Open
+driver 610.43.02. Observed outcome: **solid white background with a
+single 200×40 cyan strip at bottom-center**, matching the PASS legend.
+
+This confirms every load-bearing assumption of the Path 2 sketch:
+
+- Multi-attach of the same `wl_buffer` to two `wl_surface`s
+  simultaneously works under KWin (parent + B both attach the
+  parent's buffer; both render).
+- `wp_viewport_set_source` correctly crops the parent buffer when
+  attached to a separate subsurface (B shows only the cropped 200×40
+  rect, not the full parent buffer).
+- A subsurface created AFTER a sibling that bears its own buffer
+  lands above it by Wayland creation-order rule and renders above it
+  (B's cyan slice shows above A's white fill).
+- The combination "parent has its own buffer + sibling A has its own
+  opaque buffer + sibling B viewport-crops parent's buffer + B placed
+  above A by creation order" all composites coherently.
+
+No KWin protocol error. No NVIDIA WSI rejection. No required
+workarounds.
+
+**Path 2 is unblocked.** The wine patch sketch above ("Patch 0006 -
+virtual subsurface for occluded child HWNDs") is now a realistic
+implementation target rather than a speculative direction.
+
+Cosmetic note: the test's window has no decorations because it doesn't
+negotiate `zxdg_decoration_manager_v1`. Fixed in a follow-up commit to
+the test so future runs are easier to close.
+
+### Open implementation risks (still real, deferred to patch time)
+
+The PASS doesn't prove the wine patch will be easy - only that the
+target architecture composites correctly. Risks that remain for the
+actual wine work:
+
+1. **Lifecycle**. Wine's `wayland_win_data` is allocated per HWND and
+   destroyed on `WAYLAND_DestroyWindow`. The new "virtual" subsurface
+   path needs to plug into this lifecycle and not leak when the
+   parent's GDI buffer changes mid-frame.
+
+2. **Reattach cadence**. The test attaches B's buffer once. In wine,
+   the parent's GDI buffer rotates per paint (`wayland_window_surface_flush`).
+   Every paint of the parent must re-attach the new buffer to every
+   virtual subsurface, with the right viewport src, then commit each.
+   This is sync work; if any commit is dropped, the corresponding child
+   stops updating.
+
+3. **Sync vs desync**. The test uses `set_desync`. For wine the
+   correct mode is probably `set_sync` so children commit atomically
+   with the parent. Need to verify the destination buffer is still
+   visible during the sync window (KWin may hold the old commit
+   until parent commits the new one).
+
+4. **Input region**. The test has the default empty-input-region for
+   B, so pointer events fall through to A. For wine the toolbar's
+   virtual subsurface needs to claim input so Fusion's click handlers
+   fire on the correct HWND. The wine code that owns this is
+   `wl_surface_set_input_region` at `window.c:328` - reusable.
+
+5. **Detection of overlapping siblings**. The trigger gate ("WS_CHILD
+   that overlaps a sibling with a wayland_client_surface") needs to
+   walk wine's per-toplevel children list. The data structure for
+   that walk exists in `data->client_surface` traversal but is
+   currently keyed off `wayland_win_data_get_nolock` which acquires
+   locks - care needed to avoid deadlocks during WindowPosChanged.
+
+These are tractable but not trivial. Estimated patch size: ~150-300
+lines across `window.c`, `wayland_surface.c`, and `window_surface.c`,
+plus a new helper in `wayland_surface.c` for the cropped-buffer-attach
+sequence.
+
+### Next concrete action
+
+Now that Path 2 is verified at the protocol layer, the next concrete
+step is to write the actual wine patch (`wine-patches/0006-...`),
+starting with the trigger gate in `WAYLAND_WindowPosChanged` and the
+new helper in `wayland_surface.c`. Test inside fusion-box on Fusion
+itself, iterating with `build-wine-fast.sh`. If the patch works,
+regenerate the .patch file and add a "verified" status header per
+patch hygiene.

@@ -9,3 +9,7 @@ __pycache__/
 
 # Diagnostic captures
 debug/captures/
+
+# Generated wayland protocol code + built test binaries (per-test dirs)
+debug/wine-tests/*/*-client-protocol.[ch]
+debug/wine-tests/shared-buffer-test/shared-buffer-test

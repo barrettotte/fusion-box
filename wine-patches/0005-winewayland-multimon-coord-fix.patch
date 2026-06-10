@@ -1,4 +1,5 @@
-# fusion-box wine patch 0004
+# fusion-box wine patch 0005
+# (renumbered from 0004 on 2026-06-09 when patch 0002 was split into 0002+0003)
 # Multi-monitor coordinate fix - make wine report correct per-monitor positions
 # AND keep the primary output anchored at (0,0) so Win32 apps + DXVK don't trip.
 #
