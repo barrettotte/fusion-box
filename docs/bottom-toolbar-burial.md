@@ -1115,3 +1115,100 @@ new helper in `wayland_surface.c`. Test inside fusion-box on Fusion
 itself, iterating with `build-wine-fast.sh`. If the patch works,
 regenerate the .patch file and add a "verified" status header per
 patch hygiene.
+
+## 2026-06-09 evening - sketch-exit toolbar regression (next-session note)
+
+Patch 0006 shipped and verified. Toolbar visible on launch, comment
+menu opens/closes cleanly. New regression observed: nav toolbar
+disappears (and doesn't return) after:
+
+- **Create sketch → exit sketch.** Originally reported.
+- **Scrolling out (zoom-out) in the modeling viewport**, even with no
+  sketch involved. Suggests the trigger isn't sketch-specific - any
+  modeling-viewport interaction that causes Fusion to re-layout the
+  UI can clear WS_VISIBLE on the toolbar's HWND and not restore it.
+
+So this is a broader UI-state-transition bug, not a sketch quirk. The
+diagnosis below still applies; sketch entry/exit was just the first
+reproducer we found.
+
+### Diagnosis (from WINEDEBUG=+waylanddrv trace)
+
+Toolbar HWND (e.g. 0x2015e, 0xc0154 - varies per run) goes through
+exactly 7 WindowPosChanged decide events across a launch + sketch +
+exit + close sequence:
+
+1-4: vis=0 (initial Win32 setup before any paint)
+5-6: vis=1, style=0x56000000 - normal display, vsub created
+7: vis=0, style=0x46000000 - WS_VISIBLE cleared (sketch entry)
+
+Then ZERO further events for that HWND for the rest of the run.
+**Fusion never re-sets WS_VISIBLE to 1 after sketch exit.** The
+toolbar HWND stays alive, retains its correct rect (239x24), but
+Win32 sees it as invisible.
+
+### Why "sticky-vsub" fix doesn't work
+
+Tried: keep the virtual subsurface alive across vis=0 transitions
+(rationale: pixels were in main's GDI buffer, maybe Qt was still
+painting). Result: toolbar showed BLACK after sketch exit (and
+initial launch on some runs).
+
+Conclusion: Qt6 RESPECTS the Win32 WS_VISIBLE bit for painting
+decisions. When vis=0, Qt doesn't paint the widget. Whatever
+Fusion paints in the area (background, viewport, etc.) is what
+our crop shows.
+
+The earlier "saw toolbar briefly underneath viewport on sketch
+exit" observation was DXVK swapchain's previously-rendered content
+fading, NOT main's GDI buffer.
+
+### Where the bug lives
+
+Upstream of patch 0006. Two candidates:
+
+1. **Wine WM_SHOWWINDOW plumbing**. Fusion (or Qt) probably calls
+   `ShowWindow(toolbar, SW_SHOW)` on sketch exit. Wine should
+   deliver WM_SHOWWINDOW and set WS_VISIBLE. Something in this
+   path is dropped.
+
+2. **Qt6 + qwindows.dll visibility-propagation**. Qt6 has its own
+   `QWidget::setVisible(true)` state. The Win32 QPA plugin
+   (qwindows.dll) is responsible for translating that to
+   ShowWindow calls on the underlying HWND. Possibly this
+   translation is missing or skipped on sketch-exit transition.
+
+### Recommended diagnostic for next session
+
+Capture Win32 messages on the toolbar HWND across the sketch
+entry/exit transition:
+
+```bash
+WINEDEBUG=+message,+window,fixme-all,err-winediag \
+    bash scripts/launch-fusion.sh 2>&1 | \
+    grep -E 'WM_SHOWWINDOW|ShowWindow|SetWindowPos|SW_SHOW|SW_HIDE|WS_VISIBLE' | \
+    grep '<toolbar-hwnd>'
+```
+
+Look for: does Fusion send any visibility-related message after
+sketch exit? If yes, does it reach the toolbar HWND? Does wine
+process it correctly? Cross-reference against the same sequence
+under XWayland (FUSION_FORCE_X11=1) to see if the WS_VISIBLE
+update fires there - if it does, the bug is winewayland-specific;
+if not, it's deeper.
+
+Also worth checking: maybe the toolbar HWND gets destroyed and a
+NEW HWND is created after sketch exit, and the new HWND just
+hasn't been made visible yet. The trace showed no
+wayland_win_data_create for a new HWND in the run, but
+WINEDEBUG=+window would catch it more directly via
+NtUserCreateWindowEx.
+
+### Workaround in the meantime
+
+None at the wine layer. Users encountering this can:
+- Switch tabs (e.g. Design → Solid → Design) to force a UI redraw
+  that may re-set WS_VISIBLE
+- Resize the Fusion window (forces a layout pass)
+- Use the View menu's nav-tools entry to toggle off/on if Fusion
+  exposes it (Fusion-specific)

@@ -69,6 +69,18 @@ XWayland with a per-app override:
   attaches main's GDI buffer to it with a wp_viewport_set_source crop on
   every parent commit. Same buffer-extraction pattern Qt6's own native
   QtWaylandClient platform uses. Verified 2026-06-09 on Fusion 360.
+- `wine-patches/0007-...` (Qt6 docked-panel role-thrash dampener + HCURSOR on
+  `wayland_win_data`) - **fixed the Object Browser cursor-disappear and
+  click-flicker bugs.** Qt6 reparents WS_POPUP docked panels between
+  `Browser->main->desktop` and `Browser->desktop` chains across user
+  interaction; the two chains return different `NtUserGetAncestor(GA_ROOT)`
+  values, which made wine's role decision flip SUBSURFACE↔POPUP on every
+  click, destroying and recreating the wayland_surface each time (visible
+  flicker, lost cursor state). Two fixes: (a) moved `HCURSOR` from
+  `wayland_surface` to `wayland_win_data` so it survives any future
+  wayland_surface destroy/recreate; (b) dampened the role flip when the
+  popup owner and existing toplevel_hwnd match - they're the same logical
+  parent. Verified 2026-06-10 on Fusion 360.
 - Sign-in pipeline (`adskidmgr://` callback -> IDM token exchange) - works
   end-to-end via a host browser MIME handler; see `scripts/adskidmgr-handler.sh`
   (registered by `scripts/install-host-handler.sh`).
@@ -109,9 +121,11 @@ XWayland with a per-app override:
   Originally (pre-2026-06-08) this bullet was conflated with the bottom
   toolbar issue - re-attributed this session. Separate symptom from the
   navigation toolbar bug above; investigation has not focused on it.
-- **Object Browser click flicker + cursor disappears.** Click on a tree item
-  flickers the dock; cursor vanishes while pointer is over the dock. Suspect
-  cursor-shape race in `wayland_pointer.c`.
+- ~~**Object Browser click flicker + cursor disappears.**~~ **Fixed by patch
+  0007 (2026-06-10).** Root cause was Qt6 reparenting the WS_POPUP Browser
+  between two parent chains across click, flipping the wine role decision
+  SUBSURFACE↔POPUP and destroying+recreating the wayland_surface. See
+  patch 0007's header for the full diagnosis.
 - **Popups stay visible when parent toplevel is minimized.** xdg-shell has no
   minimize event, so wine doesn't propagate WM_SHOWWINDOW SW_PARENTCLOSING to
   owned popups - toolbar / dropdowns persist over other apps.

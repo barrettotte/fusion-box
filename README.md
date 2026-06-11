@@ -75,6 +75,21 @@ Override defaults via env:
 | `FUSION_PREWARM_IDM=0` | skip the IDSDK prewarm step in the launcher |
 | `WINE_INSTALL_PREFIX=...` | install patched wine elsewhere (default `~/wine-versions/wine-11.10-fusion`) |
 | `BOX_HOME=...` | (passed to `build-container.sh`) bind-mount this dir as the container's `$HOME` |
+| `BUILD_WINE_FORCE=1` | (passed to `build-wine.sh`) force re-extract source tarball and re-apply all patches from scratch, even if the build stamp matches. Use after editing `wine-patches/*.patch` to verify the canonical chain still applies and produces a working binary. ~5 min cold build. |
+| `WINE_WORK_TREE=...` | (passed to `build-wine-fast.sh`) rsync `winewayland.drv/` from this tree into the cached source before rebuilding. Use when iterating on patches outside the cache. |
+
+### Iterating on the wine patches
+
+Two rebuild modes:
+
+```bash
+# Fast: rebuild from whatever's currently in the cached source (~30s; for iterating on edits).
+distrobox enter fusion-box -- bash scripts/build-wine-fast.sh
+
+# Force-clean: re-extract wine 11.10 tarball, re-apply all wine-patches/*.patch from scratch, full configure + make + install (~5 min). 
+# Use after editing a patch file to verify it applies cleanly and produces a working binary - patches are the source of truth, cache is a build artifact.
+distrobox enter fusion-box -- bash -lc 'BUILD_WINE_FORCE=1 bash scripts/build-wine.sh'
+```
 
 ## Known Issues
 

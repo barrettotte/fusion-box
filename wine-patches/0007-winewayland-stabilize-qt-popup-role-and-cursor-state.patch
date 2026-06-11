@@ -1,0 +1,192 @@
+# fusion-box wine patch 0007
+# Stabilize Qt6 docked-panel role decisions and persist HCURSOR across
+# wayland_surface destroy/recreate cycles.
+#
+# Bug A - cursor disappears after clicking into Qt6 docked panels:
+# Clicking inside Fusion 360's Object Browser (a docked Qt6 panel) hides
+# the cursor until you move out of the panel and back in. Same class of
+# bug suspected on other Qt panel interactions; documented in
+# docs/observed-issues.md as "Clicking on object browser makes mouse
+# disappear temporarily (move away and back in to fix). Suspect
+# cursor-shape race in wayland_pointer.c."
+#
+# Bug B - Object Browser flickers visually on click:
+# The Browser's wl_subsurface gets torn down and recreated on user
+# interaction, producing a visible single-frame flicker. The user reports
+# both bugs together.
+#
+# Both have the same root cause - Qt6 reparents the WS_POPUP-style docked
+# panel between two parent chains during interaction:
+#   * `Browser -> main -> desktop`  (NtUserGetAncestor(GA_ROOT) returns main)
+#   * `Browser -> desktop`          (NtUserGetAncestor(GA_ROOT) returns Browser)
+# Both chains have main as the GW_OWNER of the popup, but GA_ROOT returns
+# different HWNDs. In wine 11.10's wayland_win_data_create_wayland_surface
+# (window.c:233), `toplevel_surface` is derived from GA_ROOT, and the
+# popup-detection logic (which uses GW_OWNER) is gated by `!toplevel_surface`.
+# So the role decision flips:
+#   * chain A:  toplevel_surface != NULL  -> role = SUBSURFACE
+#   * chain B:  toplevel_surface == NULL, popup_parent_surface from GW_OWNER
+#               -> role = POPUP
+# The role mismatch then trips the destroy-and-recreate block below:
+#   if (data->wayland_surface && role && surface->role && surface->role != role) {
+#       wayland_surface_destroy(data->wayland_surface);
+#       data->wayland_surface = NULL;
+#   }
+# Recreate produces a fresh wayland_surface (calloc'd, hcursor=0) and
+# triggers a wl_subsurface recreate (visual flicker). The next
+# pointer.enter then reads `surface->hcursor`, finds NULL, and commits
+# `wl_pointer.set_cursor` with an empty buffer - KWin hides the cursor.
+#
+# Verified empirically (2026-06-10):
+#   - +waylanddrv,+cursor instrumented trace shows hcursor going
+#     0x40086 -> 0 across a single click in the Browser
+#   - Surface address is reused by malloc/calloc (slab cache reuse)
+#     which initially fooled diagnosis into "surface isn't changing"
+#   - 186 STICKY-keep-SUBSURFACE dampener hits in a 4-minute session
+#     after the fix - the role-decision logic genuinely wants to flip
+#     this often; the dampener saves all of them
+#
+# Fix (two changes, both required):
+#
+# 1. Move HCURSOR storage from wayland_surface to wayland_win_data.
+#    wayland_win_data is keyed by HWND and outlives any single
+#    wayland_surface incarnation, so hcursor survives any destroy/recreate
+#    in the role-flip path. Cleanup happens in wayland_win_data_destroy
+#    (HWND really gone) instead of wayland_surface_destroy.
+#
+# 2. SUBSURFACE<->POPUP role-thrash dampener in
+#    wayland_win_data_create_wayland_surface. When the existing role is
+#    SUBSURFACE and the computed new role would be POPUP, but the
+#    popup_owner_hwnd matches the existing SUBSURFACE's tracked
+#    toplevel_hwnd, the parent is conceptually the same wayland_surface.
+#    Keep SUBSURFACE; reuse popup_parent_surface as toplevel_surface for
+#    make_subsurface (it IS the same wayland_surface object). This avoids
+#    the destroy+recreate cycle, which:
+#      - eliminates the visible flicker
+#      - preserves per-surface state that hadn't already been moved to
+#        wayland_win_data
+#      - saves a wl_surface round-trip
+#
+# Change 1 alone fixes the cursor-disappear by surviving any future
+# wayland_surface destroy. Change 2 alone reduces flicker but leaves the
+# wayland_surface destroy in the click path. Both together are correct.
+#
+# Status: verified 2026-06-10 against Fusion 360 v2703.1.11 on KDE Plasma 6
+# Wayland with NVIDIA Open 610.43.02. Cursor stays visible across all
+# Browser clicks. Browser no longer flickers visually. STICKY dampener
+# fires 100+ times across a typical interactive session, none of those
+# would have been correct role changes.
+#
+# Upstream: candidate for wine-devel submission. The HCURSOR-on-data move
+# is small and uncontroversial; the role dampener has a more nuanced
+# argument (relies on the observation that GW_OWNER and GA_ROOT can
+# disagree across Qt-side reparenting, with same logical parent).
+#
+# Apply from the wine source root: `patch -p1 < this-file`. Depends on
+# patches 0001-0006 (line offsets assume all are applied).
+#
+# Author: fusion-box (claude-code session, with Barrett Otte)
+#
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -310,7 +310,9 @@
+     BOOL resizing;
+     struct wayland_window_config window;
+     int content_width, content_height;
+-    HCURSOR hcursor;
++    /* fusion-box: hcursor moved to wayland_win_data so it survives wayland_surface
++     * destroy/recreate (which fires on Win32 role transitions, e.g. Qt docked
++     * panels flipping between POPUP and SUBSURFACE roles). See wayland_set_cursor. */
+ };
+ 
+ /**********************************************************************
+@@ -401,6 +403,13 @@
+     BOOL is_fullscreen;
+     BOOL managed;
+     BOOL layered_attribs_set;
++    /* fusion-box: cursor handle for this HWND. Lives on wayland_win_data instead
++     * of wayland_surface so it survives wayland_surface destroy/recreate cycles
++     * (e.g. Qt docked panels flipping role between POPUP and SUBSURFACE - destroy
++     * frees the old surface, recreate calloc's a fresh one with hcursor=0; on the
++     * next pointer.enter, wayland_set_cursor reads NULL and commits an empty
++     * cursor buffer, hiding the cursor until the user moves out and back in). */
++    HCURSOR hcursor;
+     /* fusion-box (patch 0006): when TRUE, wayland_surface is a "virtual" subsurface
+      * that does not own its own wl_buffer. The toplevel's GDI buffer is attached to
+      * this surface via a wp_viewport_set_source crop matching the child's rect, so
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -360,6 +360,43 @@
+     else if (toplevel_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+     else role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
+ 
++    /* fusion-box: SUBSURFACE<->POPUP role-thrash dampener.
++     *
++     * Qt docked panels (e.g., Object Browser) are WS_POPUP windows whose
++     * parent chain Qt sometimes reparents across user interaction (click,
++     * dock-position change). When the chain is `Browser -> main -> desktop`,
++     * NtUserGetAncestor(GA_ROOT) returns main, toplevel_surface is non-NIL,
++     * and the role decision picks SUBSURFACE. When Qt reparents to
++     * `Browser -> desktop` directly, GA_ROOT returns Browser itself,
++     * toplevel_surface goes NIL, popup-detection via GW_OWNER kicks in and
++     * picks the same `main` HWND as the popup owner - role flips to POPUP.
++     *
++     * The role flip forces a wayland_surface_destroy + recreate, which:
++     *   - destroys the wl_subsurface (visible flicker on next commit)
++     *   - zeroes per-surface state (we saw the cursor-disappear bug from
++     *     this exact path before moving HCURSOR off wayland_surface)
++     *   - costs a wl_surface roundtrip
++     *
++     * Detection: existing role is SUBSURFACE, computed new role is POPUP,
++     * and the popup_owner_hwnd matches the existing SUBSURFACE's tracked
++     * toplevel_hwnd. The parent is conceptually identical - just GA_ROOT
++     * returned a different walk. Keep SUBSURFACE; reuse popup_parent_surface
++     * (which IS the same wayland_surface object as the old toplevel_surface)
++     * as the make_subsurface parent. */
++    if (data->wayland_surface
++        && data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE
++        && role == WAYLAND_SURFACE_ROLE_POPUP
++        && popup_owner_hwnd
++        && popup_owner_hwnd == data->wayland_surface->toplevel_hwnd
++        && popup_parent_surface)
++    {
++        TRACE("[fusion-box] dampened SUBSURFACE->POPUP role thrash hwnd=%p toplevel_hwnd=%p popup_owner=%p\n",
++              data->hwnd, data->wayland_surface->toplevel_hwnd, popup_owner_hwnd);
++        role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
++        toplevel_surface = popup_parent_surface;
++        popup_parent_surface = NULL;
++    }
++
+     /* we can temporarily clear the role of a surface but cannot assign a different one after it's set */
+     if ((surface = data->wayland_surface) && role && surface->role && surface->role != role)
+     {
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -763,14 +763,19 @@
+ 
+     if ((data = wayland_win_data_get(hwnd)))
+     {
+-        if (!(surface = data->wayland_surface))
+-        {
+-            wayland_win_data_release(data);
+-            return;
+-        }
+-        scale = surface->window.scale;
+-        if (use_hcursor) surface->hcursor = hcursor;
+-        else hcursor = surface->hcursor;
++        /* fusion-box: read scale from wayland_surface if it exists; default 1.0
++         * otherwise. The hcursor lives on wayland_win_data (not wayland_surface),
++         * so it survives wayland_surface destroy/recreate cycles - which are
++         * common for Qt docked panels whose role flips between POPUP and
++         * SUBSURFACE on user interaction. Without this, the cursor disappears
++         * after clicking into an Object Browser panel until you move out and
++         * back in. */
++        if ((surface = data->wayland_surface))
++            scale = surface->window.scale;
++        else
++            scale = 1.0;
++        if (use_hcursor) data->hcursor = hcursor;
++        else hcursor = data->hcursor;
+         use_hcursor = TRUE;
+         wayland_win_data_release(data);
+     }
