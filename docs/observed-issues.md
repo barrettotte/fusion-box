@@ -69,6 +69,22 @@ XWayland with a per-app override:
   attaches main's GDI buffer to it with a wp_viewport_set_source crop on
   every parent commit. Same buffer-extraction pattern Qt6's own native
   QtWaylandClient platform uses. Verified 2026-06-09 on Fusion 360.
+- `wine-patches/0008-...` (raise overlay siblings above re-anchored
+  client subsurface) - **fixed nav toolbar / Object Browser / Comment menu
+  disappearing after sketch entry/exit, viewport scroll out/in, maximize,
+  CREATE menu items, component activate, Browser undock**. When Qt6
+  reanchors a DXVK swapchain to a new toplevel parent, wine's
+  `wayland_client_surface_attach` destroys the old `wl_subsurface` and
+  creates a fresh one via `wl_subcompositor.get_subsurface`. Per Wayland
+  spec, the new subsurface lands at the TOP of the parent's substack,
+  burying sibling overlay subsurfaces (patch 0006 vsubs, Browser /
+  Comments docked panels). Patch walks the wayland_win_data rb tree
+  after every re-anchor and `place_above`'s each overlay sibling on the
+  freshly-anchored client. Same family as patch 0002 (which removed the
+  per-frame `reconfigure_*` thrash) but covering the per-event re-attach
+  path that 0002 left uncovered. Verified 2026-06-10 against Fusion
+  v2703.1.11 on KDE Plasma 6 Wayland; 12 `(re)anchor` events per typical
+  session, sketch cycle lifts raised=5 siblings each direction.
 - `wine-patches/0007-...` (Qt6 docked-panel role-thrash dampener + HCURSOR on
   `wayland_win_data`) - **fixed the Object Browser cursor-disappear and
   click-flicker bugs.** Qt6 reparents WS_POPUP docked panels between
@@ -117,10 +133,47 @@ XWayland with a per-app override:
   (Qt6 upstream, invasive wine change, XWayland fallback) is or isn't
   tractable.
 
-- **Object Browser, Comments menu, ribbon tooltips disappear after maximize.**
-  Originally (pre-2026-06-08) this bullet was conflated with the bottom
-  toolbar issue - re-attributed this session. Separate symptom from the
-  navigation toolbar bug above; investigation has not focused on it.
+- ~~**Object Browser, Comments menu, ribbon tooltips disappear after maximize.**~~
+  **Fixed by patch 0008 (2026-06-10).** Same root cause as the sketch-exit
+  bug below; the maximize trigger is just another path that calls
+  `wayland_client_surface_attach` with a toplevel change.
+- ~~**Navigation toolbar, Object Browser, Comment menu disappear after sketch
+  entry/exit (and viewport scroll-out) and never reappear**~~ **Fixed by
+  patch 0008 (2026-06-10).** Investigation arc and final diagnosis:
+    - Initial (wrong) hypothesis 1: SWP_HIDEWINDOW not balanced by
+      SWP_SHOWWINDOW. Tested via interception + forced re-show in
+      `WAYLAND_WindowPosChanged`. Intercept fired, vsub was recreated, but
+      visual outcome unchanged. Falsified.
+    - Initial (wrong) hypothesis 2: destroy-without-recreate. Believed
+      Fusion called `NtUserDestroyWindow` on the toolbar HWND mid-session.
+      Falsified by a controlled 30-second-wait reproducer + stable-
+      identifier logging (`fb_log_widget` at every destroy/hide event,
+      keyed by widget class+text+rect not HWND ID): the destroys we'd
+      attributed to sketch-exit were actually at 99% of run i.e. shutdown
+      cascade. The navbar HWND committed buffers continuously during the
+      30s wait, never destroyed mid-session.
+    - User observation that broke the case open: "on shutdown sometimes I
+      see our mystery UI components rendering" - the widgets exist,
+      they're visually buried.
+    - Final (correct) diagnosis: z-order. When Qt6 reanchors the
+      viewport's DXVK swapchain to a new toplevel parent at sketch
+      transitions (and similar events), wine's
+      `wayland_client_surface_attach` takes the toplevel-change branch,
+      destroys the old `wl_subsurface`, and creates a new one via
+      `wl_subcompositor.get_subsurface`. Per Wayland spec, the new
+      subsurface lands at the TOP of the parent's substack. Sibling
+      overlay subsurfaces (navbar vsub from patch 0006, Browser /
+      Comments docked panels in SUBSURFACE role parented to main) get
+      pushed below the swapchain, which covers their screen positions.
+      Patch 0008 walks the wayland_win_data rb tree after every
+      client-subsurface re-anchor and calls `wl_subsurface_place_above`
+      on every overlay sibling to lift them back. Verified: 12
+      `[fusion-box patch 0008] client (re)anchor` events in a typical
+      session; 2 of them (sketch entry + exit) raise raised=5 siblings
+      each, exactly matching the 5 visible static UI elements that
+      previously vanished. Same family of bug as patch 0002 (per-frame
+      `reconfigure_*` thrash), which left the per-event re-attach path
+      uncovered.
 - ~~**Object Browser click flicker + cursor disappears.**~~ **Fixed by patch
   0007 (2026-06-10).** Root cause was Qt6 reparenting the WS_POPUP Browser
   between two parent chains across click, flipping the wine role decision
@@ -131,6 +184,17 @@ XWayland with a per-app override:
   owned popups - toolbar / dropdowns persist over other apps.
 - **Horizontal window resize leaves echo / artifact trails.** Vertical resize
   clean. Likely subsurface buffer not invalidated promptly on width change.
+- **Bottom timeline disappears on window resize** (noticed 2026-06-10 during
+  patch 0008 validation). The timeline (small Qt683QWindowToolSaveBits at
+  left-bottom of the viewport) vanishes when the Fusion window is resized.
+  Patch 0008 doesn't cover it: the timeline is a selfroot TOPLEVEL/POPUP-
+  role widget (not a SUBSURFACE child of main's wl_surface), so it's not
+  a sibling in main's substack and the sibling-raise walk doesn't reach
+  it. Separate code path; needs its own investigation.
+- **Workspace switch (Design ↔ Render ↔ Drawing dropdown)** - patch 0008
+  validation deferred this; some looked promising, others surfaced
+  additional rendering bugs. Future investigation.
+- **Section analysis** - deferred during patch 0008 validation.
 - **Ribbon tooltip font issues.** Tooltips render but text looks wrong. Likely
   font fallback or DPI mismatch within Qt.
 - **Window stretches across monitors when launched from non-primary 1080p
@@ -212,6 +276,19 @@ Listed so future sessions don't loop through them again.
 - **Use SetWindowRgn as a "this is an overlay, promote it" signal** - Qt
   calls `SetWindowRgn` on every Qt window for shaped-window support; not a
   useful discriminator.
+- **Intercept `SWP_HIDEWINDOW` in `WAYLAND_WindowPosChanged` and force
+  re-show via `NtUserSetWindowPos(SWP_SHOWWINDOW)` for vsub-tracked
+  children** (tested 2026-06-10, reverted same session). Built on the
+  belief that the sketch-exit navbar disappearance was a
+  hide-not-restored bug. The intercept fired but the visual outcome was
+  unchanged; trace then misread shutdown destroys as sketch-exit destroys
+  ("destroy-without-recreate" diagnosis - also wrong). The actual bug
+  was z-order, not lifecycle - fixed by patch 0008. Lesson: when a
+  symptom only manifests visually but tooling shows no
+  lifecycle/visibility change, suspect stacking; controlled reproducers
+  with explicit gaps between phases (e.g. 30s wait between sketch-exit
+  and close) are essential for disambiguating "this destroy is part of
+  the bug" from "this destroy is shutdown cleanup".
 
 - **Patch 0005 - toolbar z-promotion via place_above + parent commit**
   (tested 2026-06-08, three revisions; reverted same day). Maintained a
@@ -277,7 +354,33 @@ Confirmed via web research that the following projects all bypass
 
 - **cryinkfly** (`Autodesk-Fusion-360-on-Linux`, archived GitHub ->
   migrated to Codeberg) - recommends X11 session or Wayland with default
-  X11-via-XWayland routing; no `winewayland.drv` configuration.
+  X11-via-XWayland routing; no `winewayland.drv` configuration. The
+  patched DLLs shipped under `files/extras/patched-dlls/` (audited
+  2026-06-10) are scoped narrowly and do NOT touch the QPA / QtWidgets
+  paths we care about:
+    - `Qt6WebEngineCore.dll` (140 MB binary, no source) - per install
+      script comment line 1685 "fix the login issue and other issues":
+      patches the embedded Chromium / Blink renderer used for Fusion's
+      OAuth sign-in HTML page and asset library marketing UI. Likely
+      sandbox / namespace / seccomp workarounds for Chromium under wine.
+      **Does not affect nav toolbar, Browser, Comments, or any QtWidgets
+      rendering** - those live in `Qt6Widgets.dll` / `Qt6Gui.dll` which
+      cryinkfly ships unmodified.
+    - `siappdll.dll` - 3DConnexion SpaceMouse driver shim. Unrelated to
+      Qt or rendering; "fix the SpaceMouse issue" per script comment.
+    - `bcp47langs.zip` - registry override (set as empty
+      `DllOverrides`), not a binary patch.
+    - `files/setup/data/wine-captionless-popups.patch` - one-line
+      `winex11.drv` patch making captionless `WS_POPUP` windows
+      unmanaged. Doesn't apply to `winewayland.drv` (we don't have the
+      same window-manager-wrapping model). No analogous fix needed.
+    - `files/setup/data/fix-navbar-flicker.sh` - **not a code patch,
+      a user-prefs editor**. Sets `Contents="NavToolbar" Visible="False"`
+      in Fusion's `NULastDisplayedLayout.xml`. This is cryinkfly's
+      workaround for the navbar burial bug - they hide the toolbar in
+      Fusion's settings rather than fix the wine layer. We fixed the
+      underlying cause in patch 0008 (z-order at client-subsurface
+      re-anchor), so the workaround isn't needed here.
 - **GE-Proton 10.x** - Wayland enabled via the em10 patch series, but
   GE-Proton10-31 reverted a Wayland systray patch from 10-30 due to crashes.
   Stability bar is "play games, not run CAD".

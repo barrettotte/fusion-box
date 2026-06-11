@@ -1,0 +1,223 @@
+# fusion-box wine patch 0008
+# Raise sibling overlay wl_subsurfaces above a freshly-(re)anchored client
+# wl_subsurface (DXVK/Vulkan swapchain), restoring static UI visibility.
+#
+# Bug - Object Browser, Comment menu, and nav toolbar disappear after sketch
+# entry/exit, viewport scroll, viewport-tool dialogs (CREATE menu items),
+# component activate, browser undock, and similar actions; never reappear
+# without restarting Fusion. User-reported "they come back briefly at
+# shutdown" was the load-bearing clue: the widgets are NOT destroyed - they
+# exist, render, and commit buffers throughout the run. Verified
+# 2026-06-10 by:
+#   - 30-second-wait-at-main-UI controlled reproducer: 0 destroys during
+#     the wait; widget HWNDs (Browser, Comments, navbar) continue
+#     committing buffers via patch 0006's vsub path. Stable identifier
+#     logging (class, text, rect) at WAYLAND_DestroyWindow confirmed no
+#     Fusion-UI destroys at sketch transition - only Qt6 internal
+#     tooltip/popup-save-bits churn.
+#   - Initial misdiagnosis was "destroy-without-recreate" - falsified by
+#     timing analysis (the destroys we attributed to sketch-exit were
+#     actually shutdown destroys at 99% of run; main HWND survived to
+#     line 25244 while "destroyed" children were also at 99% i.e.
+#     simultaneous shutdown cascade).
+#
+# Root cause - z-order, not lifecycle:
+#
+# When Qt6 reanchors a child window's DXVK/Vulkan swapchain to a different
+# toplevel parent (sketch mode swaps the viewport host, scroll out/in
+# remaps client coords, etc.), wine's wayland_client_surface_attach takes
+# the toplevel-change branch (wayland_surface.c:1444):
+#
+#   1. wl_subsurface_destroy(client->wl_subsurface)
+#   2. client->wl_subsurface = wl_subcompositor_get_subsurface(
+#                                  client->wl_surface, surface->wl_surface)
+#
+# Per Wayland spec (wl_subcompositor.get_subsurface): the newly-created
+# subsurface is placed at the TOP of the parent surface's substack. Any
+# pre-existing sibling subsurfaces - patch 0006's virtual-buffer subsurface
+# for the nav toolbar, Qt6 docked panels like Object Browser and Comment
+# menu (SUBSURFACE role parented to main's wl_surface) - get pushed below
+# the freshly-anchored DXVK swapchain. The viewport swapchain rect
+# (typically 2554x1195 at offset 3,120) covers all three UI elements'
+# screen positions, so they vanish from view.
+#
+# Same family of bug as patch 0002 (which removed wl_subsurface_place_above
+# from the per-frame reconfigure_* paths to stop overlays being shoved down
+# the stack on every focus event). Patch 0002 stopped the per-frame thrash
+# but didn't address the per-event re-anchor: every (re)attach call still
+# resets the new subsurface to TOP.
+#
+# Diagnostic evidence in the validation run (2026-06-10):
+#   - 12 `[fusion-box patch 0008] client (re)anchor` events in a typical
+#     session (initial widget setup + sketch-cycle reanchors)
+#   - 10 with raised=0 (early lifecycle, no overlays exist yet)
+#   - 2 with raised=5 (sketch entry + exit), corresponding exactly to the
+#     5 user-visible static UI elements (navbar vsub + Browser + Comments +
+#     2 ribbon-area widgets) being lifted back above the swapchain
+#   - User confirmation: "obj browser, comment, and navbar stayed!"
+#
+# Fix - one helper + one call:
+#
+# 1. raise_overlay_siblings_above_client (window.c) - given the
+#    wl_surface of a just-anchored client subsurface plus its toplevel
+#    HWND, walk the wayland_win_data rb tree (the same tree patch 0003's
+#    detach_client_subsurfaces_for_toplevel walks) and for each entry
+#    whose wayland_surface->toplevel_hwnd matches and which has its own
+#    wl_subsurface (excluding the client surface itself), call
+#    wl_subsurface_place_above(sibling_sub, client_wl_surface). Single
+#    pass; the static UI elements don't visually overlap each other
+#    (navbar bottom-center, Browser right side, Comments top-right), so
+#    no need to chain place_above sibling-to-sibling - each just needs to
+#    be above the client. Header guard: bail if !toplevel || !surface.
+#
+# 2. Call site in wayland_client_surface_attach (wayland_surface.c) -
+#    inserted at the end of the toplevel-change branch, after the new
+#    wl_subsurface is created, set_desync'd, and client->toplevel is
+#    updated. Two TRACE calls added: one announcing the re-anchor (logs
+#    old/new toplevel HWNDs), one inside the helper logging the count of
+#    siblings raised.
+#
+# Coverage (validated against Fusion 360 v2703.1.11 on KDE Plasma 6
+# Wayland with NVIDIA Open 610.43.02):
+#   - Sketch entry/exit: nav toolbar, Browser, Comments stay visible
+#   - Viewport scroll out/in: same
+#   - Browser undock (drag out of dock): works, slightly stuttery
+#   - CREATE menu items (e.g. Extrude): perfect
+#   - Component activate/deactivate: looks good
+#
+# Out of scope for this patch (separate bugs):
+#   - Bottom timeline disappears on window resize. The timeline is a
+#     selfroot Qt683QWindowToolSaveBits (TOPLEVEL/POPUP role, NOT a
+#     subsurface of main), so it's not a sibling in main's substack and
+#     this patch doesn't reach it. Needs its own fix.
+#   - Workspace switch (Design <-> Render <-> Drawing dropdown) - looks
+#     promising but exhibits other rendering issues; deferred.
+#   - Section analysis - deferred.
+#
+# Drive-by: format-string cast in patch 0006's vsub CREATED trace
+# (window.c). Wine's LONG typedefs to int on x86_64 Linux but the format
+# string used %ld; previously a silent warning, became an error in our
+# build environment when a new TRACE elsewhere triggered the diagnostic
+# bundle. Belongs in patch 0006 but folded here for the audit trail of
+# when it was caught.
+#
+# Status: verified working 2026-06-10. Trace mechanism matches theory.
+# User confirmed all three target UI elements (navbar, Browser, Comments)
+# stay visible across all reproducible triggers.
+#
+# Upstream: candidate for wine-devel. The patch is small (~50 lines), the
+# Wayland-spec reasoning is precise, and the rb-tree walk pattern mirrors
+# patch 0003's already-merged-style helper. The argument needs framing
+# carefully: this is a band-aid for Qt6/Win32 application code that
+# repeatedly reattaches client surfaces to the same logical parent; the
+# "correct" fix is for the application not to do that, but Qt does and
+# the resulting z-order regression is severe for any DXVK-backed app
+# with overlay UI (CAD, IDE, graphics tools, etc).
+#
+# Apply from the wine source root: `patch -p1 < this-file`. Depends on
+# patches 0001-0007 (line offsets assume all are applied).
+#
+# Author: fusion-box (claude-code session, with Barrett Otte)
+#
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -432,6 +432,14 @@
+  * leaving child subsurfaces orphaned when their parent wl_surface dies. */
+ void detach_client_subsurfaces_for_toplevel(HWND toplevel);
+
++/* fusion-box patch 0008: after a client wl_subsurface is (re)anchored to a
++ * toplevel (which places it at TOP of the parent's substack per Wayland
++ * spec), walk the wayland_win_data rb tree and place_above each sibling
++ * overlay subsurface to lift them back atop the freshly-anchored client.
++ * Fixes static UI burial under DXVK swapchains at Fusion 360 sketch
++ * entry/exit. */
++void raise_overlay_siblings_above_client(struct wl_surface *client_wl_surface, HWND toplevel);
++
+ struct wayland_client_surface *get_client_surface(HWND hwnd);
+ void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
+ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -198,6 +198,49 @@
+ }
+
+ /***********************************************************************
++ *           raise_overlay_siblings_above_client  (patch 0008)
++ *
++ * After a DXVK/Vulkan client wl_subsurface is (re)anchored to a toplevel via
++ * wl_subcompositor_get_subsurface (in wayland_client_surface_attach), the
++ * newly-created subsurface lands at the TOP of the parent's substack per
++ * Wayland spec. For Fusion 360 this happens at sketch entry/exit when Qt6
++ * reanchors the viewport's DXVK swapchain - the swapchain ends up above the
++ * static overlay UI (navbar vsub from patch 0006, Object Browser, Comment
++ * menu, etc.). Same family as patch 0002's fix for the reconfigure_* paths,
++ * but the (re)attach path was missed.
++ *
++ * Walk the wayland_win_data rb tree finding sibling wl_subsurfaces of the
++ * same toplevel (excluding the client_surface itself) and call
++ * wl_subsurface_place_above(sibling, client_wl_surface) on each. The
++ * static UI elements don't visually overlap, so we don't need to chain
++ * place_above sibling-to-sibling - each just needs to be above the client.
++ */
++void raise_overlay_siblings_above_client(struct wl_surface *client_wl_surface, HWND toplevel)
++{
++    struct wayland_win_data *entry;
++    int raised = 0;
++
++    if (!toplevel || !client_wl_surface) return;
++
++    pthread_once(&win_data_mutex_once, win_data_mutex_init);
++    pthread_mutex_lock(&win_data_mutex);
++    RB_FOR_EACH_ENTRY(entry, &win_data_rb, struct wayland_win_data, entry)
++    {
++        struct wayland_surface *s = entry->wayland_surface;
++        if (!s) continue;
++        if (!s->wl_subsurface) continue;
++        if (s->wl_surface == client_wl_surface) continue;
++        if (s->toplevel_hwnd != toplevel) continue;
++        wl_subsurface_place_above(s->wl_subsurface, client_wl_surface);
++        raised++;
++    }
++    pthread_mutex_unlock(&win_data_mutex);
++
++    TRACE("[fusion-box patch 0008] raised=%d overlay siblings above re-anchored client on toplevel=%p\n",
++          raised, toplevel);
++}
++
++/***********************************************************************
+  *              get_mwm_decoration_for_style
+  */
+ static BOOL get_mwm_decoration_for_style( DWORD style, DWORD ex_style )
+@@ -775,7 +818,7 @@
+                         TRACE("[fusion-box-vsub] CREATED hwnd=%p toplevel=%p wl_subsurface_id=%u rect=(%ld,%ld %dx%d) input=empty\n",
+                             hwnd, toplevel,
+                             wl_proxy_get_id((struct wl_proxy *)vs->wl_subsurface),
+-                            data->rects.window.left, data->rects.window.top,
++                            (long)data->rects.window.left, (long)data->rects.window.top,
+                             w, h);
+                     }
+                     else
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -1446,6 +1446,8 @@
+         /* Real toplevel change - must move the subsurface to a new parent.
+          * Destroy old one (different parent), create fresh. Don't recurse
+          * into attach(NULL) - that path now soft-hides only. */
++        TRACE("[fusion-box patch 0008] client (re)anchor hwnd=%p old_toplevel=%p new_toplevel=%p\n",
++              hwnd, client->toplevel, toplevel);
+         if (client->wl_subsurface)
+         {
+             wl_subsurface_destroy(client->wl_subsurface);
+@@ -1465,6 +1467,12 @@
+         wl_subsurface_set_desync(client->wl_subsurface);
+
+         client->toplevel = toplevel;
++
++        /* fusion-box patch 0008: the new wl_subsurface lands at TOP of the
++         * substack per Wayland spec, burying any pre-existing sibling
++         * overlay subsurfaces (patch 0006 vsubs, Browser, Comments, etc).
++         * Walk wayland_win_data tree and raise each one back above us. */
++        raise_overlay_siblings_above_client(client->wl_surface, toplevel);
+     }
+     /* If client->toplevel == toplevel AND wl_subsurface already exists,
+      * we just reconfigure position/size below - no destroy, no recreate,
