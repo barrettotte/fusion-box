@@ -1,0 +1,163 @@
+# fusion-box wine patch 0009
+# Sync wl_subsurface positions for all SUBSURFACE-role children of a toplevel
+# at the toplevel's own commit, instead of relying on each child's
+# reconfigure_subsurface gate.
+#
+# Bug - right-edge artifact "echoes" on horizontal-shrink window resize.
+# After dragging the right edge of the Fusion window leftward (making the
+# window narrower), residual pixels from sub-widgets (Browser sidebar,
+# Comments panel, ribbon-area widgets) remained visible past the new
+# right edge of the window. Clicking inside the window eventually
+# dismissed them. Vertical resize was clean, left-to-right grow was
+# clean - only right-to-left shrink misbehaved.
+#
+# Root cause - position update gate misses non-role-change paths:
+#
+# Subsurface child positions update via wayland_surface_reconfigure_subsurface
+# (wayland_surface.c:920), which is gated on
+# `surface->processing.serial && surface->processing.processed`. Those flags
+# are set only in wayland_win_data_update_wayland_state for the SUBSURFACE
+# role, which is itself called only from wayland_win_data_create_wayland_surface
+# (window.c:899) - i.e., on role-change paths. Non-role-change
+# WAYLAND_WindowPosChanged events (which is what fires during user-driven
+# resize as Qt repositions widgets to track main's new layout) leave the gate
+# closed: wl_subsurface_set_position never gets called, the subsurface stays
+# at its last reconfigured local position.
+#
+# When main shrinks horizontally, ordinary sibling subsurfaces (Browser
+# sidebar at right side of main, Comments panel, ribbon-area pieces) stay at
+# their OLD x positions in main's coordinate system. Per xdg-shell spec,
+# `xdg_surface.set_window_geometry` informs the compositor of the window's
+# logical bounds but is NOT a clipping mask for subsurfaces - subsurfaces
+# extend freely past it. So KWin renders the stale-positioned sibling
+# subsurfaces past main's new (narrower) right edge as visible "echo"
+# artifacts.
+#
+# A click in the window triggers Qt to repaint widgets via WM_PAINT, which
+# fires set_window_surface_contents for each affected widget; the role-change
+# path doesn't run, but the iteration in set_window_surface_contents for main
+# (patch 0006's vsub iteration loop) DOES eventually walk the rb tree -
+# patch 0006's filter excludes non-vsubs, but its presence shows the right
+# hook point exists.
+#
+# Fix - extend patch 0006's vsub iteration to also update non-vsub
+# SUBSURFACE child positions, and commit main again at end of iteration:
+#
+# 1. **New branch at top of patch 0006's RB_FOR_EACH_ENTRY loop**: for each
+#    SUBSURFACE-role child of `hwnd` (the toplevel committing in this
+#    set_window_surface_contents call) that is NOT a virtual_buffer vsub,
+#    look up its current screen rect via NtUserGetWindowRect, compute
+#    local position by subtracting toplevel_rect, and call
+#    wl_subsurface_set_position. Continue to skip the vsub-specific
+#    processing below for this entry. Same coord calc as patch 0006 already
+#    uses for vsubs (`NtUserGetWindowRect` is screen-relative for any HWND
+#    - reliable across deeply nested WS_CHILD chains where `data->rects.window`
+#    would be PARENT-relative and wrong).
+#
+# 2. **Second wl_surface_commit on main** at end of iteration: the first
+#    main commit at line 1280 already attached the buffer for this frame.
+#    The position updates we just queued (both from the non-vsub branch and
+#    the vsub iteration's existing wl_subsurface_set_position calls) are
+#    pending on main's wl_surface. A second commit on main applies them
+#    atomically - no new buffer attach, no damage, just commits queued
+#    subsurface state. Without this, queued positions hang until Qt
+#    happens to trigger another main paint (lazy after resize ends);
+#    artifact echoes persist until click. With this, the positions apply on
+#    the same frame and KWin re-renders the scene correctly within the
+#    same paint cycle.
+#
+# Coverage verified (2026-06-11):
+#   - Horizontal-shrink artifacts: fixed - artifacts now self-correct
+#     within a few frames; no click required to dismiss.
+#   - Horizontal-grow: clean (was clean before).
+#   - Vertical-grow: clean (was clean before).
+#   - Sketch enter/exit, scroll, etc.: no regression - patch 0008's
+#     coverage unaffected.
+#
+# NOT fixed by this patch (separate bugs, documented in docs/observed-issues.md):
+#   - Vertical-shrink timeline disappearance: same gate root cause but the
+#     trigger is different. Specifically, the timeline is a Qt6 native
+#     toplevel-like widget (selfroot in Win32, but a SUBSURFACE child of
+#     main in Wayland terms) whose Win32 position is updated by Qt's
+#     deferred-layout system - which doesn't necessarily call SetWindowPos
+#     on every pixel of resize. Even with our walk reading
+#     NtUserGetWindowRect, we read Qt's last-set position which may be
+#     stale relative to main's current height. The fix is plausibly
+#     Qt-side (force-synchronous layout during WM_SIZE) rather than wine-
+#     side. Investigated 2026-06-11 evening: tried QT_USE_NATIVE_WINDOWS=1,
+#     QT_QPA_UPDATE_IDLE_TIME=0, QT_NO_FAST_MOVE=1 - no effect. Wine-side
+#     plateau reached on this specific bug; Qt build infra investment
+#     would be needed for further progress.
+#   - Vertical-shrink navbar-blank-white: navbar's wl_subsurface position
+#     is correct (visible at right location) but content is blank.
+#     Mechanism is patch 0006's wp_viewport crop from main's GDI buffer
+#     sees a region Qt hasn't fully painted yet during rapid resize. The
+#     navbar widget itself paints into main's GDI; if Qt's paint events
+#     are batched/deferred, wine flushes incomplete buffer to vsub.
+#     Likely same root layer (Qt deferred paint timing) as the timeline
+#     bug. Not addressed here.
+#
+# Status: verified 2026-06-11 against Fusion 360 v2703.1.11 on KDE Plasma 6
+# Wayland with NVIDIA Open 610.43.02. Horizontal shrink artifacts self-
+# correct without click. No regression on prior coverage.
+#
+# Upstream: candidate for wine-devel submission. The change is small (~30
+# lines, two hunks both inside set_window_surface_contents) and
+# architecturally clean - it extends the existing per-toplevel-commit
+# iteration that patch 0006 already established. The argument: any
+# Qt6-style application with multiple non-vsub subsurface children that
+# move during parent resize will see this class of bug; we're closing
+# the gate-misses-position-updates path that existing code only handles
+# on role changes.
+#
+# Apply from the wine source root: `patch -p1 < this-file`. Depends on
+# patches 0001-0008 (line offsets assume all are applied).
+#
+# Author: fusion-box (claude-code session, with Barrett Otte)
+#
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1270,6 +1270,30 @@
+                 RECT child_screen, child_local;
+                 int sx, sy, sw, sh;
+
++                /* fusion-box patch 0009: queue wl_subsurface_set_position for
++                 * non-vsub SUBSURFACE children of this toplevel. Unified with
++                 * vsub processing below: vsubs (patch 0006) need full buffer
++                 * attach; non-vsubs just need position update. Both share the
++                 * toplevel_rect for screen-to-local conversion. Without this,
++                 * ordinary subsurface positions only update via
++                 * reconfigure_subsurface, gated on processing.serial - set only
++                 * on role-change paths. Fixes Browser/Comments/ribbon-area
++                 * subsurfaces showing as right-edge artifacts during horizontal
++                 * shrink resize. */
++                if (!child->virtual_buffer && parent_ok && (cs = child->wayland_surface)
++                    && cs->wl_subsurface
++                    && cs->role == WAYLAND_SURFACE_ROLE_SUBSURFACE
++                    && cs->toplevel_hwnd == hwnd
++                    && NtUserGetWindowRect(child->hwnd, &child_screen, 0))
++                {
++                    int local_x = child_screen.left - toplevel_rect.left;
++                    int local_y = child_screen.top  - toplevel_rect.top;
++                    TRACE("[fusion-box-patch0009] sub_pos hwnd=%p local=(%d,%d)\n",
++                          child->hwnd, local_x, local_y);
++                    wl_subsurface_set_position(cs->wl_subsurface, local_x, local_y);
++                    continue;
++                }
++
+                 if (!child->virtual_buffer) continue;
+                 if (child->virtual_toplevel != hwnd) continue;
+                 seen++;
+@@ -1354,6 +1378,12 @@
+             if (seen > 0)
+                 TRACE("[fusion-box-vsub] parent_commit hwnd=%p seen=%d committed=%d skipped=%d\n",
+                     hwnd, seen, committed_vsubs, skipped);
++            /* fusion-box patch 0009: second commit on main to flush queued
++             * subsurface positions (from both the non-vsub branch above and
++             * any vsub set_position calls). Without this, queued positions
++             * hang until Qt happens to trigger another main paint. */
++            if (parent_ok && parent_surf && parent_surf->wl_surface)
++                wl_surface_commit(parent_surf->wl_surface);
+             wl_display_flush(process_wayland.wl_display);
+         }
+         else

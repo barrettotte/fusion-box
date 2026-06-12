@@ -69,6 +69,25 @@ XWayland with a per-app override:
   attaches main's GDI buffer to it with a wp_viewport_set_source crop on
   every parent commit. Same buffer-extraction pattern Qt6's own native
   QtWaylandClient platform uses. Verified 2026-06-09 on Fusion 360.
+- `wine-patches/0009-...` (sync non-vsub SUBSURFACE child positions on
+  toplevel commit) - **fixed right-edge artifact echoes after horizontal-
+  shrink resize.** Subsurface child positions only update via
+  `reconfigure_subsurface`, gated on `processing.serial && processed` -
+  set only on role-change paths. Non-role-change `WindowPosChanged` events
+  during resize left the gate closed, so the wl_subsurface stayed at its
+  last reconfigured local position. When main shrank horizontally, Browser
+  / Comments / ribbon-area sibling subsurfaces remained at their OLD x
+  positions past main's new right edge, visible as echo artifacts (xdg-shell
+  doesn't clip subsurfaces at `set_window_geometry`). Patch extends patch
+  0006's vsub iteration in `set_window_surface_contents` to also call
+  `wl_subsurface_set_position` for non-vsub SUBSURFACE children using their
+  current screen rect, plus a second `wl_surface_commit` on main at the end
+  of iteration to flush the queued positions atomically. Verified
+  2026-06-11; horizontal shrink artifacts now self-correct within a few
+  frames instead of persisting until click. Does NOT fix vertical-shrink
+  timeline disappearance or vertical-shrink navbar-blank-white (those have
+  the same root cause but are Qt deferred-paint timing, not addressable
+  from wine - see Open list).
 - `wine-patches/0008-...` (raise overlay siblings above re-anchored
   client subsurface) - **fixed nav toolbar / Object Browser / Comment menu
   disappearing after sketch entry/exit, viewport scroll out/in, maximize,
@@ -182,15 +201,44 @@ XWayland with a per-app override:
 - **Popups stay visible when parent toplevel is minimized.** xdg-shell has no
   minimize event, so wine doesn't propagate WM_SHOWWINDOW SW_PARENTCLOSING to
   owned popups - toolbar / dropdowns persist over other apps.
-- **Horizontal window resize leaves echo / artifact trails.** Vertical resize
-  clean. Likely subsurface buffer not invalidated promptly on width change.
-- **Bottom timeline disappears on window resize** (noticed 2026-06-10 during
-  patch 0008 validation). The timeline (small Qt683QWindowToolSaveBits at
-  left-bottom of the viewport) vanishes when the Fusion window is resized.
-  Patch 0008 doesn't cover it: the timeline is a selfroot TOPLEVEL/POPUP-
-  role widget (not a SUBSURFACE child of main's wl_surface), so it's not
-  a sibling in main's substack and the sibling-raise walk doesn't reach
-  it. Separate code path; needs its own investigation.
+- ~~**Horizontal window resize leaves echo / artifact trails on the right edge**~~
+  **Fixed by patch 0009 (2026-06-11)** - artifacts now self-correct
+  within a few frames after resize; click no longer required.
+- **Bottom timeline disappears AND navbar renders blank-white on vertical
+  shrink** (investigated 2026-06-10 evening + 2026-06-11; partial fix
+  shipped as patch 0009 for horizontal artifacts; vertical shrink remains
+  open). Top-to-bottom vertical shrink (drag the top edge down, OR pull
+  bottom edge up): bottom timeline (Qt683QWindowToolSaveBits at left-bottom
+  of viewport) vanishes, AND navbar (Qt683QWindowIcon vsub from patch 0006)
+  renders as a blank white rectangle at the correct position with no
+  buttons visible. Grow direction is clean for both. Two related but
+  separable mechanisms:
+  - **Timeline mechanism**: timeline is a Qt6 native widget (selfroot in
+    Win32 but a SUBSURFACE child of main in Wayland terms). Its Win32 rect
+    is set by Qt's deferred-layout system in response to WM_SIZE. Qt
+    DOESN'T necessarily call SetWindowPos on every pixel of resize - layout
+    is batched. So even with patch 0009's atomic position-sync at main's
+    commit, we read `NtUserGetWindowRect(timeline)` and get Qt's last-set
+    position, which may be slightly stale relative to main's current
+    height. We faithfully position the wl_subsurface there → KWin clips
+    via window_geometry → timeline disappears.
+  - **Navbar-blank-white mechanism**: navbar is patch 0006's vsub - it has
+    no own buffer; instead, main's GDI shm_buffer is attached to the
+    navbar's wl_surface with a `wp_viewport_set_source` crop at the
+    navbar's screen-rect-within-toplevel. During rapid vertical shrink,
+    Qt hasn't fully painted widgets to main's new (smaller) GDI buffer
+    yet when wine flushes it. The crop region for the navbar in main's
+    buffer is empty (white default) → navbar renders blank white at the
+    correct position.
+  - **Both mechanisms** point to Qt's deferred paint/layout timing as the
+    actual root cause. Wine-side spikes exhausted (see Failed Attempts
+    below): patch 0009 v1-v8 wine-side attempts + 2026-06-11 Qt env-var
+    spike (`QT_USE_NATIVE_WINDOWS=1`, `QT_QPA_UPDATE_IDLE_TIME=0`,
+    `QT_NO_FAST_MOVE=1`) all failed to move the needle. Plateau reached;
+    further progress likely needs Qt build infrastructure to patch
+    Qt's WM_SIZE handler for synchronous-layout, OR a careful patch 0006
+    refactor to detect "Qt hasn't painted yet" and defer the vsub commit
+    until Qt has flushed. Both are multi-day projects.
 - **Workspace switch (Design ↔ Render ↔ Drawing dropdown)** - patch 0008
   validation deferred this; some looked promising, others surfaced
   additional rendering bugs. Future investigation.
@@ -276,6 +324,92 @@ Listed so future sessions don't loop through them again.
 - **Use SetWindowRgn as a "this is an overlay, promote it" signal** - Qt
   calls `SetWindowRgn` on every Qt window for shaped-window support; not a
   useful discriminator.
+- **Various "update child subsurface positions during resize" patches**
+  (tested 2026-06-10 evening, all reverted). Attempted fixes for the
+  horizontal artifacts + timeline-on-vertical-shrink bugs. All seven
+  iterations correctly identified the gating issue in
+  `wayland_surface_reconfigure_subsurface` (`processing.serial && processed`
+  set only on role changes) but none landed cleanly:
+    1. Set `processing.serial = 1` on every WindowPosChanged for any
+       SUBSURFACE-role surface. Broke the navbar because patch 0006's
+       virtual_buffer vsubs use a separate position path
+       (`NtUserGetWindowRect` minus `toplevel_rect` inside
+       `set_window_surface_contents`'s vsub iteration) and our path raced
+       with theirs.
+    2. Same as 1, but excluded `virtual_buffer` surfaces. Navbar OK, but
+       timeline only intermittently survived shrink - the
+       `processing.serial` flag we set was overwritten before the next
+       `reconfigure_subsurface` call.
+    3. Same as 2, plus explicit `wayland_surface_reconfigure(surface)`
+       call after setting the flags. The reconfigure_subsurface path
+       does `wl_surface_commit(toplevel_surface->wl_surface)` at the end,
+       which prematurely committed main BEFORE patch 0006's vsub buffer
+       attach ran in the same `set_window_surface_contents` cycle. Result:
+       navbar's wl_surface had no buffer attached at main commit time →
+       rendered blank white.
+    4. Same as 2, but called `wl_subsurface_set_position` directly without
+       going through `wayland_surface_reconfigure` (no parent commit, just
+       queue the position request). Still didn't fix horizontal artifacts;
+       hover-race confound made navbar evaluation unreliable.
+    5. Pre-commit walk: a helper `update_subsurface_positions_for_toplevel`
+       called from `set_window_surface_contents` JUST BEFORE
+       `wayland_surface_attach_shm` and `wl_surface_commit` on main, walking
+       the wayland_win_data rb tree and queuing position requests for all
+       SUBSURFACE children. Position calc used `entry->rects.window.left`
+       directly - which is PARENT-relative (per patch 0006's own comment)
+       and wrong for deeply nested WS_CHILDren like the navbar. Navbar
+       oscillated visibly as our walk set it to wrong pos, then patch 0006
+       set it to correct pos one frame later.
+    6. Same as 5 but using `NtUserGetWindowRect` for screen-relative
+       coords, AND excluding `virtual_buffer` surfaces so patch 0006's
+       handling for the navbar is undisturbed. Walked every paint cycle
+       (~100 times/session). User reported navbar black at start, possibly
+       hover-race confound, possibly walk fighting state too aggressively.
+    7. Same as 6 but gated to fire only when the toplevel buffer SIZE
+       actually changed (added `last_committed_buffer_{width,height}` to
+       wayland_win_data). Reduced walk to resize events only. Still saw
+       timeline disappearing on shrink and navbar white (under hover-race).
+    8. `NtUserExposeWindowSurface(hwnd, 0, NULL, 0)` at the end of
+       `wayland_configure_window` (force a buffer flush on every configure,
+       not just initial). 36 configure invocations per session - no
+       improvement on right-edge artifacts. Confirms the bug isn't a
+       missed repaint; it's stale subsurface positions.
+  Lessons: (a) the fix needs to fully respect patch 0006's vsub timing -
+  vsubs use NtUserGetWindowRect inside `set_window_surface_contents` and
+  set wl_subsurface_set_position AFTER main's commit (one-frame lag that
+  was working). Any fix that commits main earlier or fights for the same
+  control breaks vsubs. (b) The hover-race (patch 0007 dampener fires
+  60+ times in a bad startup) heavily confounds visual evaluation. Future
+  attempts should isolate from it. (c) The "click dismisses artifacts"
+  pattern is real but isn't from a missed repaint - main commits 65+ times
+  per session; the artifacts are subsurfaces stuck at OLD x positions,
+  visible because xdg_surface.set_window_geometry doesn't clip subsurfaces
+  per xdg-shell spec.
+  Iteration 9 of the design (the one that shipped as patch 0009) finally
+  landed for horizontal artifacts by unifying patch 0006's vsub iteration
+  with a non-vsub branch (just position update, no buffer attach) plus a
+  second wl_surface_commit on main at end of iteration to flush the queue.
+  Vertical-shrink timeline + navbar-white still fail because they're
+  bounded by Qt's deferred paint/layout, not by the gate this patch
+  addresses - see Qt env-var spike below.
+- **Qt env-var spike** (tested 2026-06-11). Three Qt 6.8.3 env vars
+  expected to unlock more eager paint/layout behavior, all tested in
+  combination with patch 0009 active:
+    - `QT_USE_NATIVE_WINDOWS=1` (sets Qt::AA_NativeWindows, makes every
+      QWidget a real Win32 HWND with own winId) - no observable effect on
+      timeline disappearance OR navbar-blank-white. Same HWND-create count
+      as baseline (~126), suggesting either Fusion's QPA already creates
+      most widgets as native, OR the env var didn't reach Fusion's Qt
+      instance, OR Qt's deferred layout doesn't change with native windows.
+    - `QT_QPA_UPDATE_IDLE_TIME=0` (reduce paint-idle delay from default 5ms
+      to 0) + `QT_NO_FAST_MOVE=1` (disable move-without-repaint optimization
+      in QWidgetRepaintManager) - no observable effect. Tested in combination
+      with patch 0009 active + a clean (no hover-race) startup.
+  Verdict: env-var path to Qt-side fixes is exhausted. To address the
+  vertical-shrink class of bugs would need actual Qt build infrastructure
+  (mingw-w64 cross-build of qtbase in distrobox; ~1 day infra investment;
+  then targeted patch to QWindowsWindow's WM_SIZE handler to force-
+  synchronous layout).
 - **Intercept `SWP_HIDEWINDOW` in `WAYLAND_WindowPosChanged` and force
   re-show via `NtUserSetWindowPos(SWP_SHOWWINDOW)` for vsub-tracked
   children** (tested 2026-06-10, reverted same session). Built on the
