@@ -46,7 +46,7 @@ export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}${DRIVER_OVERRID
 # Wine binary. Preference order:
 #   1. $WINE_BIN if set
 #   2. The patched build from scripts/build-wine.sh (adds winewayland SSD support;
-#      see wine-patches/0001-winewayland-server-side-decorations.patch)
+#      see patches/wine/0001-winewayland-server-side-decorations.patch)
 #   3. Container's system wine-staging
 PATCHED_WINE="$HOME/wine-versions/wine-11.10-fusion/bin/wine"
 if [ -n "${WINE_BIN:-}" ]; then

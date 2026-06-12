@@ -324,7 +324,7 @@ because they look superficially relevant:
 into the extracted source at `$XDG_CACHE_HOME/fusion-box/wine-build/wine-11.10/`,
 runs `make`, and copies `.so` files into the install prefix. Iterating happens
 in the cached source tree (or wherever `WINE_WORK_TREE` points). **Patches
-under `wine-patches/` are NOT regenerated automatically.** It is easy to spend
+under `patches/wine/` are NOT regenerated automatically.** It is easy to spend
 a session iterating on `wayland_surface.c` and end up with a working wine but
 no diff captured anywhere durable.
 
@@ -619,7 +619,7 @@ the post-splash viewport uses.
 
 ### Patches state after revert
 
-`wine-patches/0001-…`, `0002-…`, `0003-…`, `0004-…` - unchanged from the start
+`patches/wine/0001-…`, `0002-…`, `0003-…`, `0004-…` - unchanged from the start
 of this session. Still upstream-track. Reverted patch 0005 means cache source
 was forcibly re-extracted from tarball via `BUILD_WINE_FORCE=1 build-wine.sh`;
 the resulting wine binary at `~/wine-versions/wine-11.10-fusion/bin/wine`
@@ -1109,7 +1109,7 @@ sequence.
 ### Next concrete action
 
 Now that Path 2 is verified at the protocol layer, the next concrete
-step is to write the actual wine patch (`wine-patches/0006-...`),
+step is to write the actual wine patch (`patches/wine/0006-...`),
 starting with the trigger gate in `WAYLAND_WindowPosChanged` and the
 new helper in `wayland_surface.c`. Test inside fusion-box on Fusion
 itself, iterating with `build-wine-fast.sh`. If the patch works,

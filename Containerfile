@@ -30,11 +30,21 @@ RUN pacman -Sy --noconfirm --needed \
 # PE binaries (AdskIdentityManager.exe, IdIPCServer.dll, Nu*10.dll) when we have to dig into Fusion internals.
 # mingw-w64 is for cross-compiling any DLL stubs we need to drop into the wineprefix.
 # Both are heavyweight but invaluable when the bug is several layers deep.
+# cmake + ninja: cross-build Qt 6.8.3 (qtbase) for Windows via mingw-w64. The Qt
+# patches under patches/qt/ target qwindows.dll's WM_SIZE handler etc. and need
+# a real Qt source rebuild, not a binary mod. python pulled in for Qt's syncqt
+# and other build helpers. qt6-base on Arch supplies host moc/rcc/syncqt that
+# Qt's cross-build invokes via QT_HOST_PATH=/usr; without it the build can't
+# generate moc files for the cross target.
 RUN pacman -Sy --noconfirm --needed \
         mingw-w64-gcc \
         mingw-w64-headers \
         mingw-w64-winpthreads \
-        radare2
+        radare2 \
+        cmake \
+        ninja \
+        python \
+        qt6-base
 
 # wine + winetricks. DXVK and vkd3d-proton are installed per-prefix by
 # `winetricks dxvk` / `winetricks vkd3d` at prefix-init time (Phase 3 script);

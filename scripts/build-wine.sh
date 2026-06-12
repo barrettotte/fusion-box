@@ -7,7 +7,7 @@
 # captured by KWin as resize-start.
 # Patching wine to speak the decoration protocol (MR !10259) fixes both.
 #
-# Idempotent: re-runs cheap if the install dir already exists and its patch stamp matches the current wine-patches/ contents.
+# Idempotent: re-runs cheap if the install dir already exists and its patch stamp matches the current patches/wine/ contents.
 # Force a rebuild with `BUILD_WINE_FORCE=1`.
 
 set -euo pipefail
@@ -17,7 +17,7 @@ WINE_SRC_URL="https://dl.winehq.org/wine/source/11.x/wine-${WINE_VERSION}.tar.xz
 INSTALL_PREFIX="${WINE_INSTALL_PREFIX:-$HOME/wine-versions/wine-${WINE_VERSION}-fusion}"
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PATCHES_DIR="$REPO_DIR/wine-patches"
+PATCHES_DIR="$REPO_DIR/patches/wine"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/fusion-box/wine-build"
 SRC_TARBALL="$CACHE_DIR/wine-${WINE_VERSION}.tar.xz"
 SRC_DIR="$CACHE_DIR/wine-${WINE_VERSION}"

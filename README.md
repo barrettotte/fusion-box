@@ -75,7 +75,7 @@ Override defaults via env:
 | `FUSION_PREWARM_IDM=0` | skip the IDSDK prewarm step in the launcher |
 | `WINE_INSTALL_PREFIX=...` | install patched wine elsewhere (default `~/wine-versions/wine-11.10-fusion`) |
 | `BOX_HOME=...` | (passed to `build-container.sh`) bind-mount this dir as the container's `$HOME` |
-| `BUILD_WINE_FORCE=1` | (passed to `build-wine.sh`) force re-extract source tarball and re-apply all patches from scratch, even if the build stamp matches. Use after editing `wine-patches/*.patch` to verify the canonical chain still applies and produces a working binary. ~5 min cold build. |
+| `BUILD_WINE_FORCE=1` | (passed to `build-wine.sh`) force re-extract source tarball and re-apply all patches from scratch, even if the build stamp matches. Use after editing `patches/wine/*.patch` to verify the canonical chain still applies and produces a working binary. ~5 min cold build. |
 | `WINE_WORK_TREE=...` | (passed to `build-wine-fast.sh`) rsync `winewayland.drv/` from this tree into the cached source before rebuilding. Use when iterating on patches outside the cache. |
 
 ### Iterating on the wine patches
@@ -86,7 +86,7 @@ Two rebuild modes:
 # Fast: rebuild from whatever's currently in the cached source (~30s; for iterating on edits).
 distrobox enter fusion-box -- bash scripts/build-wine-fast.sh
 
-# Force-clean: re-extract wine 11.10 tarball, re-apply all wine-patches/*.patch from scratch, full configure + make + install (~5 min). 
+# Force-clean: re-extract wine 11.10 tarball, re-apply all patches/wine/*.patch from scratch, full configure + make + install (~5 min). 
 # Use after editing a patch file to verify it applies cleanly and produces a working binary - patches are the source of truth, cache is a build artifact.
 distrobox enter fusion-box -- bash -lc 'BUILD_WINE_FORCE=1 bash scripts/build-wine.sh'
 ```
@@ -126,7 +126,7 @@ Tests:
 If any patches or code were ripped from another source, the patch has clear attribution at the top of the file.
 
 - The `bcp47langs` `WINEDLLOVERRIDES` workaround was independently discovered (cryinkfly issue #432 and wine MR !6131 reached the same answer).
-- The SSD patch under `wine-patches/0001-...` is a verbatim backport of wine MR `!10259` (still in flight as of wine 11.10), 
+- The SSD patch under `patches/wine/0001-...` is a verbatim backport of wine MR `!10259` (still in flight as of wine 11.10), 
   plus two trivial hunks against `waylanddrv.h` for drift.
 
 ## References

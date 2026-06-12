@@ -29,17 +29,17 @@ XWayland with a per-app override:
 
 ### Fixed by our wine patches
 
-- `wine-patches/0001-...` (SSD via wine MR !10259) - window drag / resize / title
+- `patches/wine/0001-...` (SSD via wine MR !10259) - window drag / resize / title
   bar clicks. Without it KDE Plasma 6 draws decoration on top of wine's surface
   and clicks at the edge are eaten by KWin-as-resize.
-- `wine-patches/0002-...` (stop `wl_subsurface_place_above` thrash in
+- `patches/wine/0002-...` (stop `wl_subsurface_place_above` thrash in
   `reconfigure_{client,subsurface}`) - restored visibility of bottom toolbar,
   comments panel, ribbon tooltips, splash dismissal, object browser stability.
   Per Wayland spec, `place_above(sub, parent)` puts `sub` IMMEDIATELY above
   the reference in the substack; multiple siblings all re-asserting against
   the same anchor on every frame meant only the last-called sibling stayed
   topmost. **Verified safe and load-bearing 2026-06-09.**
-- `wine-patches/0003-...` (keep client subsurface alive across detach) -
+- `patches/wine/0003-...` (keep client subsurface alive across detach) -
   **verified 2026-06-09.** Half A: skips wine's destroy-on-soft-detach in
   `wayland_client_surface_attach`, preserving sibling z-order across
   focus/configure cycles. Half B: walks the wayland_win_data rb tree at
@@ -47,20 +47,20 @@ XWayland with a per-app override:
   whose parent toplevel is dying, avoiding the `wl_subsurface error 0:
   no parent` KWin termination Fusion's comment-menu dismiss originally
   triggered. Originally bundled with 0002; split out 2026-06-09.
-- `wine-patches/0004-...` (xdg_popup support) - CREATE dropdown, extrude menu,
+- `patches/wine/0004-...` (xdg_popup support) - CREATE dropdown, extrude menu,
   ribbon tooltips, sketch palette. WS_POPUP-with-owner windows now create an
   xdg_popup anchored to the owner's xdg_surface; without this they were
   free-floating xdg_toplevels that KWin placed arbitrarily. The patch also
   relaxes the WS_EX_LAYERED-without-attribs visibility gate for WS_POPUP (Qt6
   marks QMenu/tooltips layered for drop-shadow without ever calling
   SetLayeredWindowAttributes).
-- `wine-patches/0005-...` (multimon coord fix) - fixed CREATE menu position,
+- `patches/wine/0005-...` (multimon coord fix) - fixed CREATE menu position,
   resolution-dependent ribbon click/hover dead zones, sketch palette cropping,
   viewport edge-resize cursor zones. Root cause was `wayland_add_device_modes`
   not stamping `dmPosition` on the modes array, so `win32u/sysparams.c`'s
   `physical = *modes` collapsed all monitor geometry to (0,0). Same bug class
   as winex11.drv's 2019 fix (commit `23b28323cb`, bug #37709).
-- `wine-patches/0006-...` (virtual subsurface for occluded Qt6 WS_CHILD widgets)
+- `patches/wine/0006-...` (virtual subsurface for occluded Qt6 WS_CHILD widgets)
   - **fixed the nav toolbar burial** documented in `docs/bottom-toolbar-burial.md`.
   The center-bottom navigation toolbar (orbit/pan/zoom/fit) is a Qt6
   WS_CHILD widget that paints into main's GDI buffer; sibling DXVK widgets
@@ -69,26 +69,7 @@ XWayland with a per-app override:
   attaches main's GDI buffer to it with a wp_viewport_set_source crop on
   every parent commit. Same buffer-extraction pattern Qt6's own native
   QtWaylandClient platform uses. Verified 2026-06-09 on Fusion 360.
-- `wine-patches/0009-...` (sync non-vsub SUBSURFACE child positions on
-  toplevel commit) - **fixed right-edge artifact echoes after horizontal-
-  shrink resize.** Subsurface child positions only update via
-  `reconfigure_subsurface`, gated on `processing.serial && processed` -
-  set only on role-change paths. Non-role-change `WindowPosChanged` events
-  during resize left the gate closed, so the wl_subsurface stayed at its
-  last reconfigured local position. When main shrank horizontally, Browser
-  / Comments / ribbon-area sibling subsurfaces remained at their OLD x
-  positions past main's new right edge, visible as echo artifacts (xdg-shell
-  doesn't clip subsurfaces at `set_window_geometry`). Patch extends patch
-  0006's vsub iteration in `set_window_surface_contents` to also call
-  `wl_subsurface_set_position` for non-vsub SUBSURFACE children using their
-  current screen rect, plus a second `wl_surface_commit` on main at the end
-  of iteration to flush the queued positions atomically. Verified
-  2026-06-11; horizontal shrink artifacts now self-correct within a few
-  frames instead of persisting until click. Does NOT fix vertical-shrink
-  timeline disappearance or vertical-shrink navbar-blank-white (those have
-  the same root cause but are Qt deferred-paint timing, not addressable
-  from wine - see Open list).
-- `wine-patches/0008-...` (raise overlay siblings above re-anchored
+- `patches/wine/0008-...` (raise overlay siblings above re-anchored
   client subsurface) - **fixed nav toolbar / Object Browser / Comment menu
   disappearing after sketch entry/exit, viewport scroll out/in, maximize,
   CREATE menu items, component activate, Browser undock**. When Qt6
@@ -104,7 +85,7 @@ XWayland with a per-app override:
   path that 0002 left uncovered. Verified 2026-06-10 against Fusion
   v2703.1.11 on KDE Plasma 6 Wayland; 12 `(re)anchor` events per typical
   session, sketch cycle lifts raised=5 siblings each direction.
-- `wine-patches/0007-...` (Qt6 docked-panel role-thrash dampener + HCURSOR on
+- `patches/wine/0007-...` (Qt6 docked-panel role-thrash dampener + HCURSOR on
   `wayland_win_data`) - **fixed the Object Browser cursor-disappear and
   click-flicker bugs.** Qt6 reparents WS_POPUP docked panels between
   `Browser->main->desktop` and `Browser->desktop` chains across user
@@ -201,13 +182,23 @@ XWayland with a per-app override:
 - **Popups stay visible when parent toplevel is minimized.** xdg-shell has no
   minimize event, so wine doesn't propagate WM_SHOWWINDOW SW_PARENTCLOSING to
   owned popups - toolbar / dropdowns persist over other apps.
-- ~~**Horizontal window resize leaves echo / artifact trails on the right edge**~~
-  **Fixed by patch 0009 (2026-06-11)** - artifacts now self-correct
-  within a few frames after resize; click no longer required.
+- **Horizontal window resize leaves echo / artifact trails on the right edge.**
+  Dragging the right edge leftward leaves residual pixels from sibling
+  subsurfaces (Browser sidebar, Comments panel, ribbon-area widgets) past
+  main's new right edge until a click. Root cause is the
+  `reconfigure_subsurface` position gate (`processing.serial && processed`)
+  firing only on role-change paths; non-role-change `WindowPosChanged`
+  events during resize leave wl_subsurface positions stale, and xdg-shell
+  doesn't clip subsurfaces at `set_window_geometry`. Patch 0009 attempted
+  to fix this (2026-06-11) by walking the rb tree in
+  `set_window_surface_contents` and forcing `wl_subsurface_set_position` +
+  a second `wl_surface_commit` on main. **Reverted 2026-06-12**: under
+  controlled retest, the fix worked on the first drag but artifacts
+  returned on subsequent drags - not a reliable fix. See Failed Attempts
+  for the full v1-v9 iteration log.
 - **Bottom timeline disappears AND navbar renders blank-white on vertical
-  shrink** (investigated 2026-06-10 evening + 2026-06-11; partial fix
-  shipped as patch 0009 for horizontal artifacts; vertical shrink remains
-  open). Top-to-bottom vertical shrink (drag the top edge down, OR pull
+  shrink** (investigated 2026-06-10 evening + 2026-06-11; wine-side
+  plateau confirmed). Top-to-bottom vertical shrink (drag the top edge down, OR pull
   bottom edge up): bottom timeline (Qt683QWindowToolSaveBits at left-bottom
   of viewport) vanishes, AND navbar (Qt683QWindowIcon vsub from patch 0006)
   renders as a blank white rectangle at the correct position with no
@@ -217,11 +208,11 @@ XWayland with a per-app override:
     Win32 but a SUBSURFACE child of main in Wayland terms). Its Win32 rect
     is set by Qt's deferred-layout system in response to WM_SIZE. Qt
     DOESN'T necessarily call SetWindowPos on every pixel of resize - layout
-    is batched. So even with patch 0009's atomic position-sync at main's
-    commit, we read `NtUserGetWindowRect(timeline)` and get Qt's last-set
-    position, which may be slightly stale relative to main's current
-    height. We faithfully position the wl_subsurface there → KWin clips
-    via window_geometry → timeline disappears.
+    is batched. Any wine-side position-sync at main's commit reads
+    `NtUserGetWindowRect(timeline)` and gets Qt's last-set position, which
+    may be stale relative to main's current height. We faithfully position
+    the wl_subsurface there → KWin clips via window_geometry → timeline
+    disappears.
   - **Navbar-blank-white mechanism**: navbar is patch 0006's vsub - it has
     no own buffer; instead, main's GDI shm_buffer is attached to the
     navbar's wl_surface with a `wp_viewport_set_source` crop at the
@@ -232,7 +223,8 @@ XWayland with a per-app override:
     correct position.
   - **Both mechanisms** point to Qt's deferred paint/layout timing as the
     actual root cause. Wine-side spikes exhausted (see Failed Attempts
-    below): patch 0009 v1-v8 wine-side attempts + 2026-06-11 Qt env-var
+    below): nine wine-side patch-0009 design iterations (all reverted) +
+    2026-06-11 Qt env-var
     spike (`QT_USE_NATIVE_WINDOWS=1`, `QT_QPA_UPDATE_IDLE_TIME=0`,
     `QT_NO_FAST_MOVE=1`) all failed to move the needle. Plateau reached;
     further progress likely needs Qt build infrastructure to patch
@@ -374,6 +366,15 @@ Listed so future sessions don't loop through them again.
        not just initial). 36 configure invocations per session - no
        improvement on right-edge artifacts. Confirms the bug isn't a
        missed repaint; it's stale subsurface positions.
+    9. **Shipped briefly as patch 0009, then reverted 2026-06-12.** Unified
+       patch 0006's vsub iteration with a non-vsub branch (queue
+       wl_subsurface_set_position from `NtUserGetWindowRect` for each
+       SUBSURFACE child) plus a second `wl_surface_commit` on main at end
+       of iteration to flush the queue atomically. Initial test session
+       (2026-06-11) showed clean horizontal shrink; was committed as patch
+       0009. Controlled retest 2026-06-12 falsified the win: artifacts
+       appeared self-corrected on the FIRST drag but came back on
+       subsequent drags. Not a reliable fix. Reverted; bug returned to Open.
   Lessons: (a) the fix needs to fully respect patch 0006's vsub timing -
   vsubs use NtUserGetWindowRect inside `set_window_surface_contents` and
   set wl_subsurface_set_position AFTER main's commit (one-frame lag that
@@ -384,17 +385,12 @@ Listed so future sessions don't loop through them again.
   pattern is real but isn't from a missed repaint - main commits 65+ times
   per session; the artifacts are subsurfaces stuck at OLD x positions,
   visible because xdg_surface.set_window_geometry doesn't clip subsurfaces
-  per xdg-shell spec.
-  Iteration 9 of the design (the one that shipped as patch 0009) finally
-  landed for horizontal artifacts by unifying patch 0006's vsub iteration
-  with a non-vsub branch (just position update, no buffer attach) plus a
-  second wl_surface_commit on main at end of iteration to flush the queue.
-  Vertical-shrink timeline + navbar-white still fail because they're
-  bounded by Qt's deferred paint/layout, not by the gate this patch
-  addresses - see Qt env-var spike below.
+  per xdg-shell spec. (d) A reproducer that drags the right edge once and
+  declares victory is insufficient - subsequent drags can re-expose the
+  bug. Retest by dragging in/out multiple times before claiming a fix.
 - **Qt env-var spike** (tested 2026-06-11). Three Qt 6.8.3 env vars
-  expected to unlock more eager paint/layout behavior, all tested in
-  combination with patch 0009 active:
+  expected to unlock more eager paint/layout behavior, tested 2026-06-11
+  in combination with the v9-design (later reverted as patch 0009):
     - `QT_USE_NATIVE_WINDOWS=1` (sets Qt::AA_NativeWindows, makes every
       QWidget a real Win32 HWND with own winId) - no observable effect on
       timeline disappearance OR navbar-blank-white. Same HWND-create count
@@ -403,13 +399,30 @@ Listed so future sessions don't loop through them again.
       instance, OR Qt's deferred layout doesn't change with native windows.
     - `QT_QPA_UPDATE_IDLE_TIME=0` (reduce paint-idle delay from default 5ms
       to 0) + `QT_NO_FAST_MOVE=1` (disable move-without-repaint optimization
-      in QWidgetRepaintManager) - no observable effect. Tested in combination
-      with patch 0009 active + a clean (no hover-race) startup.
+      in QWidgetRepaintManager) - no observable effect. Tested with the
+      v9-design active + a clean (no hover-race) startup.
   Verdict: env-var path to Qt-side fixes is exhausted. To address the
   vertical-shrink class of bugs would need actual Qt build infrastructure
   (mingw-w64 cross-build of qtbase in distrobox; ~1 day infra investment;
   then targeted patch to QWindowsWindow's WM_SIZE handler to force-
   synchronous layout).
+- **Qt MinGW cross-build attempt** (2026-06-11): set up `patches/qt/`
+  + `scripts/build-qt.sh` doing a two-stage native-host then mingw-w64
+  cross-build of qtbase 6.8.3. Built successfully end-to-end. Drafted
+  (and later removed, untested) a Qt source patch targeting
+  `qwindowswindow.cpp`'s `fireExpose` and `handleGeometryChange` to use
+  Qt's `SynchronousDelivery` template arg instead of the default async
+  (mirroring the precedent already at line 1588 of the same file). When
+  we dropped the built MinGW DLLs into Fusion's webdeploy dir, Fusion
+  **failed to load**: Fusion is MSVC-built and looks up Qt symbols by
+  MSVC name mangling (`??0QString@@QEAA@PEBD@Z`); our MinGW DLLs export
+  Itanium mangling (`_ZN7QStringC1EPKc`). Cannot substitute without
+  rebuilding Qt with MSVC. Infrastructure (`patches/qt/`,
+  `scripts/build-qt.sh`, Containerfile deps) is preserved for the future
+  MSVC track - `build-qt.sh` is one toolchain-file swap away from MSVC -
+  but the untested patch was discarded so we don't carry dead code. The
+  actual blocker and next-step path documented in
+  `[[qt-msvc-abi-blocker]]` memory.
 - **Intercept `SWP_HIDEWINDOW` in `WAYLAND_WindowPosChanged` and force
   re-show via `NtUserSetWindowPos(SWP_SHOWWINDOW)` for vsub-tracked
   children** (tested 2026-06-10, reverted same session). Built on the
