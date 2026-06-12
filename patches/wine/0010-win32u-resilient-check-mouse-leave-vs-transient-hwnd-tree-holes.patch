@@ -1,0 +1,155 @@
+# fusion-box wine patch 0010
+# Skip WM_MOUSELEAVE when window_from_point returns NULL but the cursor is
+# still geometrically inside the tracked HWND's window rect - treat that as
+# a transient hole in the Win32 widget tree, not a real mouse-leave.
+#
+# Bug - Qt tooltip never appears after hover ("hover-bug" remaining after
+# patch 0009 v2 fixed the cursor flicker). User reports: hovering a ribbon
+# button (e.g., EXTRUDE) for 5 seconds in bad-startup state, the button's
+# icon-highlight fires correctly (Qt registered hover-enter) but the text
+# tooltip never paints. On hover-leave the highlight clears as expected.
+#
+# Diagnosis (2026-06-12 capture with WINEDEBUG=+waylanddrv,+cursor,+win,+msg
+# and a tight reproducer protocol; see debug/captures/hover-race-20260612-192337.log
+# for the bad-state evidence). Mechanism, in execution order:
+#
+#   1. Qt's tooltip widget (Qt683QWindowToolSaveBits class, WS_POPUP+
+#      WS_EX_TOOLWINDOW, owner=main) is shown after the hover-dwell timer
+#      fires - we see show_window cmd=4 (SW_SHOWNOACTIVATE) on the tooltip
+#      HWND, e.g. line 112740 of the bad trace for hwnd 0xa01dc.
+#   2. Within ~400 lines (a few frames), wine fires SW_HIDE on that same
+#      tooltip HWND (line 113175). The tooltip never paints; user perceives
+#      the no-show.
+#   3. Looking at the messages immediately before SW_HIDE (line 113170-ish):
+#         peek_message ... msg 118 (WM_SYSTIMER) hwnd 0x4005e
+#         update_mouse_tracking_info hwnd 0x4005e
+#         get_mouse_window point (631,66) hwnd (nil) hittest 0   <-- NULL
+#         update_mouse_tracking_info tracked pos (628,55), current pos (631,66)
+#         NtUserPostMessage hwnd 0x30154 msg 2a3 (WM_MOUSELEAVE)
+#         show_window hwnd=0xa01dc, cmd=0
+#      That `hwnd (nil)` is the proximate trigger: `window_from_point` at
+#      the cursor position returned NULL - the cursor is over no HWND.
+#   4. `check_mouse_leave` (dlls/win32u/input.c) sees `hwnd (NULL) !=
+#      tracking->info.hwndTrack (0x30154)`, posts WM_MOUSELEAVE on 0x30154.
+#   5. Qt's tooltip-controller HWND receives WM_MOUSELEAVE, interprets it
+#      as "user left the hovered widget", calls SW_HIDE on the tooltip
+#      via QWidgetPrivate::hideToolTip. Tooltip dies before paint.
+#
+# Why `window_from_point` returns NULL during stationary hover:
+# Heavy Qt widget churn. During "bad startup" Fusion's Qt creates and
+# destroys ~100 widgets (Qt683QWindowToolSaveBits painter scratch surfaces,
+# Qt683QWindowIcon utility windows, IME helpers, etc.) in the seconds
+# around the hover. Each create-destroy briefly leaves a HOLE at that
+# screen position - until the next widget repositions into it, window_from_point
+# at the cursor coords returns NULL. The cursor hasn't moved, but the
+# widget tree under it has.
+#
+# Counter comparison good vs bad (same protocol, same trace channels):
+#                                     | good run | bad run
+#   update_mouse_tracking_info calls  |    50    |   126
+#   WM_MOUSELEAVE posted              |     3    |    10
+#   transient NULL window_from_point  |     0    |     7+
+# Bad state delivers ~3x as many spurious leaves; each one kills one
+# pending tooltip.
+#
+# Fix - in check_mouse_leave, before the existing "hwndTrack != hwnd ->
+# post MOUSELEAVE" path, gate on a transient-hole detection:
+#
+#   if (!hwnd && pos && tracking->info.hwndTrack &&
+#       NtUserGetWindowRect(tracking->info.hwndTrack, &track_rect, 0) &&
+#       cursor pos is inside track_rect)
+#       return;  // swallow the spurious leave
+#
+# Why this is correct:
+#   - The cursor hasn't actually moved out of the tracked HWND's geometric
+#     bounds; only the immediate hit-test failed.
+#   - The next WM_SYSTIMER tick (~50ms) will re-evaluate. If the gap
+#     closed up and window_from_point now returns the real tracked HWND,
+#     no leave was needed. If the cursor genuinely moved out of the rect
+#     by then, that tick fires the leave normally.
+#   - Doesn't suppress real cross-HWND moves where window_from_point
+#     returns a different HWND (not NULL) - that path is unchanged.
+#   - NtUserGetWindowRect handles destroyed-HWND case by returning FALSE,
+#     so a stale tracked->info.hwndTrack falls through to the normal
+#     leave path.
+#
+# Required signature change: pass the current cursor pos into
+# check_mouse_leave. Both call sites (update_mouse_tracking_info and
+# NtUserTrackMouseEvent) already compute `pos` via get_mouse_window.
+#
+# Status: drafted 2026-06-12. Patch 0009 v2 reduces but doesn't eliminate
+# the bad-state symptom; 0010 targets the remaining Qt-tooltip-drop case.
+# To verify: capture another bad-state run with the same +msg trace and
+# count WM_MOUSELEAVE deliveries. Expect drop from ~10 in bad state to
+# closer to good baseline (~3).
+#
+# Applies cleanly on a wine-11.10 source tree with patches 0001-0009
+# applied (no prior wine patch touches input.c).
+#
+# Author: fusion-box (claude-code session, with Barrett Otte)
+#
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -1672,8 +1672,43 @@
+     tracking->last_mouse_message_pos = pos;
+ }
+ 
+-static void check_mouse_leave( HWND hwnd, int hittest, struct mouse_tracking_info *tracking )
++static void check_mouse_leave( HWND hwnd, int hittest, struct mouse_tracking_info *tracking, const POINT *pos )
+ {
++    /* fusion-box patch 0010: when window_from_point returned NULL (cursor is
++     * over no known HWND) but the cursor is still geometrically inside the
++     * tracked HWND's rectangle, treat it as a TRANSIENT HOLE in the Win32
++     * widget tree rather than a real mouse-leave. This avoids spurious
++     * WM_MOUSELEAVE delivery during heavy Qt widget create/destroy churn
++     * (e.g., Fusion 360 startup, tooltip-show paths) where window_from_point
++     * briefly returns NULL between widget transitions. Without this, every
++     * such NULL fires WM_MOUSELEAVE on the tracked hwnd, Qt cancels its
++     * pending tooltip (SW_HIDE before paint), and the user sees an
++     * icon-highlight without ever seeing the tooltip text.
++     *
++     * Only kicks in when:
++     *   - get_mouse_window returned NULL hwnd (cursor over no HWND at all)
++     *   - we have a tracked hwnd to compare against
++     *   - cursor position is geometrically within tracked hwnd's window rect
++     * In that case, swallow the leave. The next WM_SYSTIMER tick will
++     * re-evaluate; if the gap closed up and the cursor is over the real
++     * tracked hwnd, no leave was needed. If the cursor genuinely moved out
++     * of the tracked rect, that next tick fires the leave normally. */
++    if (!hwnd && pos && tracking->info.hwndTrack)
++    {
++        RECT track_rect = {0};
++        if (NtUserGetWindowRect(tracking->info.hwndTrack, &track_rect, 0) &&
++            pos->x >= track_rect.left && pos->x < track_rect.right &&
++            pos->y >= track_rect.top && pos->y < track_rect.bottom)
++        {
++            TRACE("[fusion-box patch 0010] swallowed spurious MOUSELEAVE: cursor (%d,%d) "
++                  "still inside tracked hwnd %p rect (%d,%d)-(%d,%d) (window_from_point returned NULL)\n",
++                  (int)pos->x, (int)pos->y, tracking->info.hwndTrack,
++                  (int)track_rect.left, (int)track_rect.top,
++                  (int)track_rect.right, (int)track_rect.bottom);
++            return;
++        }
++    }
++
+     if (tracking->info.hwndTrack != hwnd)
+     {
+         if (tracking->info.dwFlags & TME_NONCLIENT)
+@@ -1743,7 +1778,7 @@
+            hover_width, hover_height );
+ 
+     if (tracking->info.dwFlags & TME_LEAVE)
+-        check_mouse_leave( hwnd, hittest, tracking );
++        check_mouse_leave( hwnd, hittest, tracking, &pos );
+ 
+     if (tracking->info.hwndTrack != hwnd)
+         tracking->info.dwFlags &= ~TME_HOVER;
+@@ -1869,7 +1904,7 @@
+          * WM_MOUSEMOVE and call TrackMouseEvent before TrackMouseEventProc is
+          * called. In such a situation, post the WM_MOUSELEAVE now. */
+         if ((tracking->info.dwFlags & TME_LEAVE) && tracking->info.hwndTrack != NULL)
+-            check_mouse_leave( hwnd, hittest, tracking );
++            check_mouse_leave( hwnd, hittest, tracking, &pos );
+ 
+         NtUserKillSystemTimer( tracking->info.hwndTrack, SYSTEM_TIMER_TRACK_MOUSE );
+         tracking->info.hwndTrack = 0;

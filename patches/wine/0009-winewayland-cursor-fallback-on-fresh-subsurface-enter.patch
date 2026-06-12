@@ -1,0 +1,182 @@
+# fusion-box wine patch 0009
+# Stop calling wl_pointer.set_cursor with a NULL surface from pointer.enter
+# when the entered hwnd has no cached cursor - either inherit the last
+# successfully-applied cursor, or (on the very first enter of the session)
+# skip the wire call entirely.
+#
+# Bug - visible cursor flicker / "hover-race" on first hover after some
+# Fusion startups (~50% of launches reported as triggering it). Symptom: the
+# first time you hover any tooltip-bearing UI element (ribbon button, sketch
+# plane, etc.), the cursor briefly disappears then reappears, and Qt's hover
+# state (tooltip timer, sketch hover-target) gets dropped. Repeats while
+# the pointer crosses between two overlapping wl_subsurfaces.
+#
+# Diagnosis (2026-06-12 +waylanddrv,+cursor,+win,WAYLAND_DEBUG=1 capture,
+# good vs bad startup comparison):
+#
+#   Counters         | good baseline | bad case
+#   -----------------+---------------+----------
+#   set_cursor wire  |       1       |    4
+#   set_shape calls  |      10       |   19
+#   pointer.enter    |       4       |    9
+#   WAYLAND_SetCursor|      11       |   16
+#
+# The mechanism is the SAME in both states - bad just triggers it more often.
+# Mechanism:
+#   1. KWin fires wl_pointer.leave(old_surface) + wl_pointer.enter(new_surface)
+#      every time the cursor crosses a wl_subsurface boundary - including
+#      child subsurfaces of main inside Fusion's own window.
+#   2. wine's pointer_handle_enter (wayland_pointer.c:206) calls
+#      `wayland_set_cursor(hwnd, NULL, FALSE)` - i.e., "use whatever cursor
+#      we have cached for this hwnd, none explicit."
+#   3. wayland_set_cursor reads `data->hcursor` (patch 0007's per-hwnd
+#      cursor storage on wayland_win_data). If the entered hwnd is a fresh
+#      subsurface that Win32 hasn't called SetCursor on yet, data->hcursor
+#      is NULL.
+#   4. With hcursor=NULL, the function falls into the "clear cursor" path:
+#      wayland_pointer_update_cursor_buffer(NULL) -> goto clear_cursor ->
+#      shm_buffer is unref'd, then wayland_pointer_update_cursor_surface
+#      sees cursor->wl_surface = NULL, and we send
+#      wl_pointer.set_cursor(serial, nil, 0, 0) - which HIDES the cursor.
+#   5. Win32 SetCursor fires moments later (~5-20ms) - WAYLAND_SetCursor
+#      runs with hcursor=0x4007a (Qt's arrow); cursor reappears.
+#
+# Steps 4->5 is the visible flicker. Each pointer.enter on a fresh subsurface
+# causes one cursor blink. The "bad startup" case is bad because something
+# in Qt's layout makes the cursor ping-pong between main (wl_surface#81)
+# and one of its child subsurfaces (wl_surface#283) repeatedly, so the user
+# sees several blinks in rapid succession, and every blink resets the Win32
+# hover tracker - cancelling tooltips, dropping sketch-plane hover targets,
+# etc.
+#
+# Trace evidence (bad case, around line 78437 of
+# debug/captures/hover-race-20260612-181413.log):
+#     [3482272.813] wl_pointer#30.leave(12977, wl_surface#81)
+#     [3482272.821] wl_pointer#30.enter(12977, wl_surface#283, 222.43, 0.79)
+#     [3482272.830] -> wl_pointer#30.set_cursor(12977, nil, 0, 0)     <- HIDE
+#     [3482272.834] -> wp_cursor_shape_device_v1#46.destroy()
+#     ...12ms later, Win32 wakes up:
+#     [WAYLAND_SetCursor hwnd=0x3c0134 hcursor=0x4007a]
+#     [3482272.971] -> wp_cursor_shape_manager_v1#12.get_pointer(new id ...)
+#     [3482272.976] -> wp_cursor_shape_device_v1#418.set_shape(12977, 1) <- RESHOW
+#
+# Fix - two complementary mechanisms in wayland_set_cursor:
+#
+#   1. Add `HCURSOR last_hcursor` to struct wayland_pointer (waylanddrv.h),
+#      track the cursor most recently pushed to the compositor.
+#   2. On pointer_handle_enter -> wayland_set_cursor(hwnd, NULL, FALSE)
+#      (i.e., use_hcursor=FALSE, "use cached"), if data->hcursor turns out
+#      to be NULL but pointer->last_hcursor is set, use last_hcursor instead
+#      of the NULL hide-cursor path. Preserves continuity across subsurface
+#      boundary crossings.
+#   3. If BOTH data->hcursor AND pointer->last_hcursor are NULL (true on the
+#      very first pointer.enter of the session), skip the wire call entirely.
+#      Per Wayland spec, "the cursor image is undefined" after enter just
+#      lets the compositor display whatever it wants - KWin keeps showing
+#      the previous cursor, which is what the user expects. Better than
+#      actively hiding.
+#   4. Both fixes are gated on the original `use_hcursor==FALSE` state, so
+#      explicit WAYLAND_SetCursor(hwnd, NULL, TRUE) from Win32 (Qt wanting
+#      to hide the cursor, e.g., during window destroy) is still honored.
+#
+# Validation (2026-06-12 second capture iteration with patch v1 - only
+# items 1 and 2 in place, no skip-on-first-enter):
+#   v1 reduced bad-state counters but missed the first-enter case:
+#     set_cursor(nil) wire calls: 4 -> 2 (one was first-enter, one was Win32 NULL)
+#     set_shape: 19 -> 11
+#     pointer.enter: 9 -> 5
+#     wp_cursor_shape_device destroy: 2 -> 0
+#   User still saw flicker on first-enter. Item 3 (skip on no-cache-no-last)
+#   was added to handle the first-enter case.
+#
+# Doesn't fix the secondary mechanism (why bad startups make the pointer
+# ping-pong at all - probably a Qt subsurface layout in bad state placing
+# two overlapping child windows under the cursor). But the visible damage
+# from the ping-pong is the cursor flicker, which this patch eliminates.
+#
+# Status: drafted 2026-06-12, v1 partially landed (counter reductions
+# verified), v2 (with skip-on-first-enter) staged.
+#
+# Apply from the wine source root: `patch -p1 < this-file`. Depends on
+# patches 0001-0008 (line offsets assume all are applied).
+#
+# Author: fusion-box (claude-code session, with Barrett Otte)
+#
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -122,6 +122,14 @@
+     uint32_t enter_serial;
+     uint32_t button_serial;
+     struct wayland_cursor cursor;
++    /* fusion-box: last hcursor successfully applied to the pointer. Used as a
++     * fallback in wayland_set_cursor when pointer.enter fires on an hwnd whose
++     * data->hcursor is NULL (typically a freshly-created subsurface that Win32
++     * hasn't called SetCursor on yet). Without this fallback, every such
++     * enter would call wl_pointer.set_cursor with a NULL surface (hides the
++     * cursor) before Win32 SetCursor restores it milliseconds later, producing
++     * a visible flicker on each subsurface boundary crossing. */
++    HCURSOR last_hcursor;
+     double accum_x;
+     double accum_y;
+     pthread_mutex_t mutex;
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -760,6 +760,12 @@
+     struct wayland_win_data *data;
+     double scale;
+     BOOL reapply_clip = FALSE;
++    /* fusion-box: only allow the last_hcursor fallback (below) when the caller
++     * did NOT pass an explicit cursor. WAYLAND_SetCursor(hwnd, NULL) is Win32
++     * explicitly asking to hide the cursor - honor that as-is. The fallback is
++     * for the pointer_handle_enter case where use_hcursor=FALSE and the new
++     * hwnd has no cached data->hcursor yet. */
++    BOOL fallback_to_last_hcursor = !use_hcursor;
+
+     if ((data = wayland_win_data_get(hwnd)))
+     {
+@@ -785,6 +791,33 @@
+     }
+
+     pthread_mutex_lock(&pointer->mutex);
++
++    /* fusion-box: fallback for fresh subsurfaces. On pointer.enter, KWin fires
++     * leave(old_surface)+enter(new_surface) every time the cursor crosses a
++     * wl_subsurface boundary. wine's pointer_handle_enter calls us with
++     * use_hcursor=FALSE expecting to use the new hwnd's cached cursor; for a
++     * fresh subsurface (one Win32 hasn't called SetCursor on yet),
++     * data->hcursor is NULL, and we'd otherwise send wl_pointer.set_cursor
++     * with a NULL surface - hiding the cursor until Win32 SetCursor restores
++     * it ~ms later. That gap is the visible flicker. Falling back to the last
++     * cursor we successfully showed preserves continuity across the boundary. */
++    if (fallback_to_last_hcursor && !hcursor && pointer->last_hcursor)
++        hcursor = pointer->last_hcursor;
++
++    /* fusion-box: if we have NEITHER an hwnd-cached cursor NOR a last-applied
++     * cursor (true on the very first pointer.enter of the session), skip the
++     * wire call entirely. Per Wayland spec, an "undefined" cursor after enter
++     * lets the compositor display whatever it wants - KWin keeps showing the
++     * previous cursor, which is what the user expects. Actively emitting
++     * set_cursor(serial, nil) instead would HIDE the cursor until Win32
++     * SetCursor fires. Only applies to the fallback path; explicit
++     * WAYLAND_SetCursor(hwnd, NULL) from Win32 still hides (intentional). */
++    if (fallback_to_last_hcursor && !hcursor)
++    {
++        pthread_mutex_unlock(&pointer->mutex);
++        return;
++    }
++
+     if (pointer->focused_hwnd == hwnd)
+     {
+         if ((!use_hcursor && pointer->wp_cursor_shape_device_v1) ||
+@@ -805,6 +838,11 @@
+         }
+         wl_display_flush(process_wayland.wl_display);
+         reapply_clip = TRUE;
++
++        /* fusion-box: cache the cursor we just applied for the next enter into
++         * a fresh subsurface. Only cache non-NULL to avoid resurrecting a
++         * stale value if Win32 has cleared it. */
++        if (hcursor) pointer->last_hcursor = hcursor;
+     }
+     pthread_mutex_unlock(&pointer->mutex);
+

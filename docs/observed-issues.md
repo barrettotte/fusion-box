@@ -69,6 +69,50 @@ XWayland with a per-app override:
   attaches main's GDI buffer to it with a wp_viewport_set_source crop on
   every parent commit. Same buffer-extraction pattern Qt6's own native
   QtWaylandClient platform uses. Verified 2026-06-09 on Fusion 360.
+- `patches/wine/0009-...` (cursor fallback on fresh subsurface enter) -
+  **fixed cursor flicker on subsurface boundary crossings ("hover-race"
+  startup flicker).** On every `wl_pointer.enter`, wine's
+  `pointer_handle_enter` calls `wayland_set_cursor(hwnd, NULL, FALSE)` to
+  "use whatever cursor was cached for this hwnd". When the entered hwnd is a
+  fresh subsurface (Win32 hasn't called SetCursor on it yet), `data->hcursor`
+  is NULL, and the fall-through path emits `wl_pointer.set_cursor(serial, nil)`
+  - which HIDES the cursor. Win32 SetCursor restores it ~5-20ms later. That
+  gap is the visible flicker. The "bad startup" case made this much worse
+  because something in Qt's layout made the pointer ping-pong between
+  main (wl_surface#81) and one of its child subsurfaces (wl_surface#283) -
+  4 set_cursor(nil) cascades per session instead of the baseline 1.
+  Patch: add `HCURSOR last_hcursor` to wayland_pointer; in
+  `wayland_set_cursor`, fall back to last_hcursor when data->hcursor is NULL
+  (only when caller passed use_hcursor=FALSE - explicit Win32 hide still
+  honored); cache the cursor we just applied on every successful set.
+  On the very-first-enter case where neither cache exists, skip the wire
+  call entirely (Wayland "undefined cursor" semantics let the compositor
+  keep showing what it was showing - matches user expectation). Verified
+  2026-06-12 across 8 sessions: pre-patch bad case had 4 set_cursor(nil)
+  events; post-patch all sessions (including reported-bad) have at most 1,
+  and that 1 is always the Win32-explicit-NULL hide during a window
+  destroy (which is intentional Qt behavior).
+- `patches/wine/0010-...` (resilient check_mouse_leave vs transient HWND-tree
+  holes) - **fixed Qt tooltip-drop on hover in bad-startup state.** Symptom:
+  hovering a ribbon button, the icon-highlight fires (Qt registered
+  hover-enter) but the text tooltip never paints; on hover-leave the
+  highlight clears as expected. Was originally conflated with the cursor-
+  flicker bug (patch 0009 territory) but persisted after 0009. Root cause:
+  during Qt's heavy widget create/destroy churn (~100 widgets created
+  during a 27s hover in bad state), wine's `window_from_point` briefly
+  returns NULL at the cursor coords - the cursor is over no known HWND for
+  a few milliseconds while Qt repositions widgets. `check_mouse_leave`
+  treats NULL as "different HWND than tracked", posts WM_MOUSELEAVE, Qt
+  interprets that as "user left hover target" and calls SW_HIDE on the
+  pending tooltip via QWidgetPrivate::hideToolTip. Tooltip dies before
+  paint. Patch: in `check_mouse_leave`, when `window_from_point` returned
+  NULL but cursor is still geometrically inside the tracked HWND's rect
+  (per NtUserGetWindowRect), swallow the leave - treat the NULL as a
+  transient hole, not a real cross-HWND move. Next WM_SYSTIMER tick
+  (~50ms) re-evaluates. Verified 2026-06-12 across 3 sessions: patch
+  fires 32-75 times per session catching real transient holes; tooltip
+  appeared on every hover attempt. Pre-patch bad state had 10
+  WM_MOUSELEAVE deliveries; post-patch 2-4 (matches good-state baseline).
 - `patches/wine/0008-...` (raise overlay siblings above re-anchored
   client subsurface) - **fixed nav toolbar / Object Browser / Comment menu
   disappearing after sketch entry/exit, viewport scroll out/in, maximize,
@@ -237,6 +281,14 @@ XWayland with a per-app override:
 - **Section analysis** - deferred during patch 0008 validation.
 - **Ribbon tooltip font issues.** Tooltips render but text looks wrong. Likely
   font fallback or DPI mismatch within Qt.
+- ~~**Ribbon button tooltips intermittently fail to appear.**~~ **Fixed by
+  patch 0010 (2026-06-12).** Root cause was `window_from_point` returning
+  NULL during transient holes in the HWND tree (heavy Qt widget churn);
+  `check_mouse_leave` interpreted NULL as cross-HWND move and fired
+  spurious WM_MOUSELEAVE on the tracked HWND, triggering Qt's tooltip
+  SW_HIDE. Patch 0010 swallows the leave when cursor is still
+  geometrically within the tracked HWND's rect. See patch 0010's header
+  for the full investigation chain and trace evidence.
 - **Window stretches across monitors when launched from non-primary 1080p
   display.** `SM_CXSCREEN`/`SM_CYSCREEN` report the primary's (Acer 2560×1440)
   dimensions; Fusion sizes to that even on a smaller monitor. Workaround: park
