@@ -36,14 +36,24 @@ RUN pacman -Sy --noconfirm --needed \
 # and other build helpers. qt6-base on Arch supplies host moc/rcc/syncqt that
 # Qt's cross-build invokes via QT_HOST_PATH=/usr; without it the build can't
 # generate moc files for the cross target.
+# ghidra + jdk21: r2 hits its limits on the 148MB Qt6WebEngineCore.dll. Ghidra's
+# decompiler + persistent project model is the right tool for finding patch sites
+# inside Chromium-122 code (the Data Panel render investigation). Heavy install
+# (~1GB) but the project file is reusable across sessions, unlike r2's per-session
+# re-analysis. See docs/qt6webengine-binary-patch.md.
 RUN pacman -Sy --noconfirm --needed \
         mingw-w64-gcc \
         mingw-w64-headers \
         mingw-w64-winpthreads \
         radare2 \
+        ghidra \
+        jdk21-openjdk \
+        ccache \
         cmake \
         ninja \
         python \
+        python-capstone \
+        python-pefile \
         qt6-base
 
 # wine + winetricks. DXVK and vkd3d-proton are installed per-prefix by

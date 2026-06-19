@@ -70,6 +70,29 @@ export QT_ENABLE_HIGHDPI_SCALING=0
 export QT_AUTO_SCREEN_SCALE_FACTOR=0
 export QT_SCALE_FACTOR=1
 
+# QTWEBENGINE_CHROMIUM_FLAGS: collapse Qt6WebEngineCore's multi-process Chromium
+# architecture into a single process. Diagnostic-only opt-in (FUSION_QTWE_SINGLE_PROCESS=1).
+#
+# Bug: Fusion's Data Panel (cloud projects) renders blank + offset off-screen.
+# Trace (2026-06-15) showed the Data Panel's HWND chain spans MULTIPLE wine
+# processes - Fusion main (Qt toplevel 0x1b0166 with wayland_surface) and one
+# or more QtWebEngineProcess subprocesses (each with their OWN wayland connection
+# and OWN winewayland.drv win_data_rb). When patch 0006 in the subprocess walks
+# up to find the Qt toplevel's wayland_surface, the cross-process lookup returns
+# NULL because the subprocess doesn't know about HWNDs in another process's
+# win_data_rb. Even if it did, you can't get_subsurface against another process's
+# wl_surface - wayland connections are per-process.
+#
+# --single-process forces Chromium to run renderer + GPU + browser in one
+# process. All HWNDs collapse into one wine process, patch 0006's lookup
+# succeeds, and the existing vsub eligibility may render the panel correctly.
+# Chromium upstream considers --single-process unstable for general use, so we
+# leave this off by default until we verify it doesn't break anything else
+# (sign-in WebView2 path uses a different engine and shouldn't be affected).
+if [ "${FUSION_QTWE_SINGLE_PROCESS:-0}" = 1 ]; then
+    export QTWEBENGINE_CHROMIUM_FLAGS="${QTWEBENGINE_CHROMIUM_FLAGS:-} --single-process"
+fi
+
 # Most-recent Fusion360.exe under webdeploy/production.
 # Fusion auto-update lands new versions as sibling hash dirs; this picks whichever was modified last.
 FUSION_EXE=$(find "$PREFIX/drive_c/Program Files/Autodesk/webdeploy/production" \

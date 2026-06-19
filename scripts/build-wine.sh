@@ -26,12 +26,25 @@ STAMP_FILE="$INSTALL_PREFIX/.fusion-box-build-stamp"
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
-# Compute a stamp of (wine version + sha256 of all patches in order). Lets us skip rebuilds when nothing has changed.
+# Honour MAX_PATCH_NUM if set: emit only patches whose numeric prefix is <= the limit.
+# Used to bisect which patch introduces a regression — `MAX_PATCH_NUM=0` builds vanilla,
+# `MAX_PATCH_NUM=6` builds with patches 0001..0006.
+filtered_patches() {
+    for p in "$PATCHES_DIR"/*.patch; do
+        [ -f "$p" ] || continue
+        if [ -n "${MAX_PATCH_NUM:-}" ]; then
+            num=$(basename "$p" | sed -E 's/^0*([0-9]+).*/\1/')
+            [ "$num" -le "$MAX_PATCH_NUM" ] || continue
+        fi
+        echo "$p"
+    done
+}
+
+# Compute a stamp of (wine version + sha256 of applied patches in order). Lets us skip rebuilds when nothing has changed.
 expected_stamp() {
     {
         echo "wine=${WINE_VERSION}"
-        for p in "$PATCHES_DIR"/*.patch; do
-            [ -f "$p" ] || continue
+        filtered_patches | while read -r p; do
             echo "patch=$(basename "$p"):$(sha256sum "$p" | cut -d' ' -f1)"
         done
     } | sha256sum | cut -d' ' -f1
@@ -60,16 +73,36 @@ rm -rf "$SRC_DIR"
 log "extracting source"
 tar -xf "$SRC_TARBALL" -C "$CACHE_DIR"
 
-log "applying patches from $PATCHES_DIR"
-for p in "$PATCHES_DIR"/*.patch; do
-    [ -f "$p" ] || continue
+if [ -n "${MAX_PATCH_NUM:-}" ]; then
+    log "applying patches from $PATCHES_DIR (MAX_PATCH_NUM=$MAX_PATCH_NUM)"
+else
+    log "applying patches from $PATCHES_DIR"
+fi
+filtered_patches | while read -r p; do
     log "  $(basename "$p")"
     ( cd "$SRC_DIR" && patch -p1 < "$p" >/dev/null )
 done
 
 mkdir -p "$BUILD_DIR"
+
+# Wrap host + cross compilers with ccache when available. Wine has separate
+# CC vars per arch; matching the wrapping cuts incremental rebuild times
+# from ~5 minutes to ~30 seconds on a warm cache (most files unchanged
+# between patches/wine/* iterations). Cache lives in ~/.ccache (host-mounted
+# home, so persists across container restarts). Opt out with USE_CCACHE=0.
+CCACHE_ARGS=()
+if [ "${USE_CCACHE:-1}" = 1 ] && command -v ccache >/dev/null; then
+    CCACHE_ARGS=(
+        CC="ccache gcc"
+        x86_64_CC="ccache x86_64-w64-mingw32-gcc"
+    )
+    log "ccache wrapping enabled ($(ccache --version | head -1))"
+fi
+
 log "configure"
-( cd "$BUILD_DIR" && ../configure --prefix="$INSTALL_PREFIX" --enable-archs=x86_64 --disable-tests > configure.log 2>&1 )
+( cd "$BUILD_DIR" && ../configure --prefix="$INSTALL_PREFIX" \
+    --enable-archs=x86_64 --disable-tests \
+    "${CCACHE_ARGS[@]}" > configure.log 2>&1 )
 
 log "build (this takes a few minutes)"
 ( cd "$BUILD_DIR" && make -j"$(nproc)" > build.log 2>&1 )

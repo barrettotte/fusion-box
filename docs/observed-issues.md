@@ -25,6 +25,17 @@ XWayland with a per-app override:
 
     wine reg add 'HKCU\Software\Wine\AppDefaults\Fusion360.exe\Drivers' /v Graphics /d x11 /f
 
+**XWayland caveat (2026-06-18)**: on KDE Plasma 6 wayland sessions the
+X11 path is NOT a complete workaround for everything. Confirmed under
+`FUSION_FORCE_X11=1`:
+- 3D viewport renders **black** (known DXVK-on-X11 issue, was noted as
+  the reason fusion-box exists).
+- Data Panel renders **black** (different failure mode than wayland's
+  blank, but same outcome: unusable).
+For the modeling use case (viewport-centric), wayland is the only
+working path. XWayland may still help on pure-X11 sessions (Xfce,
+etc.) but cryinkfly issue #614 reports Data Panel breakage there too.
+
 ## Current symptom state
 
 ### Fixed by our wine patches
@@ -151,6 +162,135 @@ XWayland with a per-app override:
 
 ### Open - winewayland-specific
 
+- **Navbar renders blank-white after maximize.** Noted 2026-06-12 while
+  setting up the multimon repro. Same blank-white symptom class as the
+  existing vertical-shrink case below - the navbar is a patch 0006 vsub
+  with main's GDI shm_buffer attached via `wp_viewport_set_source` crop,
+  so a buffer that hasn't been repainted with the new geometry shows
+  white. Both probably trace to Qt's deferred-paint timing on WM_SIZE -
+  patch 0006's vsub commit happens before Qt has actually painted the
+  navbar pixels into main's shm_buffer.
+- **Data Panel (cloud projects) renders blank and main content overflows
+  window edge.** Two Chromium engines in Fusion: WebView2 (Microsoft,
+  sign-in OAuth) and Qt6WebEngineCore (Qt's Chromium wrapper, used by the
+  Data Panel).
+
+  **Root cause (revised 2026-06-16, from trace
+  `debug/captures/data-panel-20260615-162839.log`):** the Data Panel's
+  HWND chain spans MULTIPLE WINE PROCESSES. `QtWebEngineProcess` spawns
+  separate wine processes (verified: `WerRegisterCustomMetadata
+  "ProcessType", "browser"` + independent `wayland_process_init` with its
+  own `wl_display`). Each wine process has its OWN winewayland.drv with
+  its OWN `win_data_rb` and its OWN wayland connection. The Qt root
+  toplevel (`0x1b0166`, `Qt683QWindowIcon "Fusion360"`) HAS a wayland
+  surface (`0x55557e49dc60`, TOPLEVEL role) — but in Fusion main's
+  process. The Data Panel HWND (`0x1019e`, created by Chromium subprocess
+  thread `1118`) is reparented via `NtUserSetParent` onto a chain that
+  walks up to `0x1b0166`, but when patch 0006 in the subprocess calls
+  `wayland_win_data_get_nolock(0x1b0166)` the lookup returns NULL — the
+  subprocess's rb-tree doesn't know about HWNDs in another process's
+  win_data_rb. Result: `toplevel_surf=(nil) tl_role=-1 eligible=0`,
+  destroy branch fires, no wayland role assigned, KWin never sees the
+  panel.
+
+  The previous (2026-06-12) hypothesis — "multi-level chain where NONE
+  have wayland_surfaces" — was wrong. The wayland_surfaces exist, just in
+  a different wine process than where the lookup runs.
+
+  **This isn't fixable purely in winewayland.drv** — even if patch 0006
+  could discover the cross-process toplevel HWND's surface, wayland
+  connections are per-process. You can't `get_subsurface(parent_surface)`
+  against a `wl_surface` belonging to another process's wayland
+  connection.
+
+  **Candidate fixes (in order of tractability):**
+
+  1. ~~**`QTWEBENGINE_CHROMIUM_FLAGS="--single-process"`**~~ — TESTED
+     2026-06-18, DEAD END. Qt WebEngine forcibly strips/overrides
+     subprocess flags. Two variants tried:
+     `--single-process` alone (trace `data-panel-20260618-164810.log`) and
+     `--single-process --no-sandbox --in-process-gpu` +
+     `QTWEBENGINE_DISABLE_SANDBOX=1` (trace `data-panel-20260618-165656.log`).
+     Both traces still show separate `browser`/`renderer`/`gpu-process`/
+     `utility` Chromium subprocesses. The `FUSION_QTWE_SINGLE_PROCESS=1`
+     toggle in `scripts/launch-fusion.sh` is left in place for
+     documentation but is functionally a no-op. To actually force
+     single-process we'd need to patch `Qt6WebEngineCore.dll`'s
+     flag-rejection code (option 4 below).
+  2. **Force XWayland for the whole process** (`FUSION_FORCE_X11=1`) —
+     known to render the Data Panel correctly but breaks the wayland
+     mission and reintroduces other UI bugs.
+  3. **Cross-process wayland surface proxy** — would need wineserver-
+     mediated wl_surface handle export/import. Massive infrastructure
+     work; not realistic without upstream wine buy-in.
+  4. **Patch `Qt6WebEngineCore.dll` to strip the single-process flag
+     rejector.** Two sub-paths:
+     - 4a: binary-patch the shipped DLL via radare2 (~1–2 days; fragile
+       across Fusion auto-updates since the patch site moves).
+     - 4b: cross-build `qtwebengine` 6.8.3 from source with MSVC, apply
+       the patch, drop in the rebuilt DLL (weeks: msvc-wine setup →
+       qtbase MSVC build → Chromium ~6.8.3 vintage build → qtwebengine
+       build). Durable, matches the upstream-track ethos. Chosen
+       direction as of 2026-06-18; see `project_data_panel_investigation`
+       memory and [[qt-msvc-abi-blocker]] for prereqs.
+  5. **Patch Qt6WebEngineCore to render to shared dmabuf/shm** with IPC
+     handoff to Fusion main — same MSVC blocker as 4b, plus much deeper
+     patch.
+
+  **Option 3 design (drafted as fallback)**:
+  `docs/data-panel-cross-process-toplevel-design.md` specifies a
+  wine-side patch that promotes cross-process Chromium HWNDs to
+  standalone `xdg_toplevel`s when their parent's `wayland_surface`
+  isn't visible. Data Panel becomes a floating window adjacent to
+  Fusion main — worse UX than inline-docked but achievable in wine
+  alone and durable across Fusion auto-updates. Reserved as the
+  fallback if option 4a (binary patch) doesn't land.
+
+  **Deep research verdict (2026-06-18)**: 23-source cross-checked
+  research with adversarial verification confirmed **no existing fix
+  exists anywhere** for any Qt6WebEngine (or other multi-process
+  Win32 Chromium) app under winewayland.drv. Architectural root
+  cause is the Wayland protocol's by-design exclusion of
+  cross-process subsurface embedding (per wl_subsurface co-author
+  Pekka Paalanen, 2013). xdg-foreign-v2 doesn't fill the gap (only
+  allows xdg_toplevel parenting). 8 refuted claims documented —
+  notably Collabora's 2022 "Chrome works on winewayland" marketing
+  claim is empirically false. cryinkfly upstream archived 2026-02-21.
+  See `project_data_panel_investigation` memory for the full report.
+
+  **Failed attempts (do not repeat):** patch 0011 v1 (re-run role-decide
+  in patch 0006's destroy branch — didn't fire, data->wayland_surface
+  already NULL); patch 0011 v2 (new branch for visible non-WS_CHILD
+  HWNDs — didn't fire, `0x1019e` is WS_CHILD even when visible);
+  cryinkfly's `Qt6WebEngineCore.dll` swap (their DLL is from June 2025,
+  ABI-incompatible with current auto-updated Fusion, 3 of 4 launches
+  crashed); disabling WebView2 via `WINEDLLOVERRIDES` (breaks sign-in
+  OAuth, same engine); `--single-process` Chromium flag in every variant
+  tried (Qt strips/overrides).
+
+  **Forward patch bisect (2026-06-18):** rebuilt wine 11.10 nine times
+  with `MAX_PATCH_NUM={0,1,2,3,4,5,6,7,8}` and tested Data Panel after
+  each. **Every combination rendered blank.** This conclusively rules out
+  the fusion-box patch stack as the cause — the bug is either in
+  upstream wine 11.10's winewayland.drv (cross-process wayland_surface
+  limitation) or in Fusion's bundled `Qt6WebEngineCore.dll` itself.
+  Vanilla wine-staging 11.10 (`WINE_BIN=/usr/bin/wine`) also rendered
+  blank, corroborating the upstream-origin verdict.
+
+  The bisect knob `MAX_PATCH_NUM` in `scripts/build-wine.sh` is left in
+  place as a general-purpose tool for future per-patch regression
+  bisects on this or other bugs.
+
+  **Webdeploy DLL audit (2026-06-18):** mtime histogram of Fusion's
+  webdeploy showed 465 DLLs dated 2026-06-05 (initial install), then
+  Qt6Core/Gui/Widgets updated 2026-06-11, then **only
+  `Qt6WebEngineCore.dll` updated 2026-06-12**. fusion-box project
+  started 2026-06-09 — there's a 3-day window where the user had the
+  original DLL. User's recollection of "Data Panel worked early in the
+  project" maps to that window. **Strong correlation: Autodesk's
+  2026-06-12 update broke the Data Panel under wine.** Pre-update DLL
+  not locally recoverable (ext4, no snapshots, no .fusion-box-qt-backup
+  of WebEngineCore, no installer cache).
 - **Navigation toolbar (bottom-center orbit/pan/zoom/fit) does not render
   after splash dismisses.** Widget identified 2026-06-08 as a
   Qt683QWindowIcon WS_CHILD at (1161,1285)-(1400,1309) 239x24, parented to
@@ -289,10 +429,17 @@ XWayland with a per-app override:
   SW_HIDE. Patch 0010 swallows the leave when cursor is still
   geometrically within the tracked HWND's rect. See patch 0010's header
   for the full investigation chain and trace evidence.
-- **Window stretches across monitors when launched from non-primary 1080p
-  display.** `SM_CXSCREEN`/`SM_CYSCREEN` report the primary's (Acer 2560×1440)
-  dimensions; Fusion sizes to that even on a smaller monitor. Workaround: park
-  cursor on the primary before launch.
+- ~~**Window stretches across monitors when launched from non-primary 1080p
+  display.**~~ **Could not reproduce 2026-06-12.** Retested per-protocol:
+  launched maximized on 1440p primary + close + relaunch on 1080p secondary.
+  Window sized correctly to the secondary. Trace (debug/captures/multimon-*.log,
+  WINEDEBUG=+win,+system,+nonclient,+waylanddrv) shows Fusion did NOT call
+  `SM_CXSCREEN`/`SM_CYSCREEN` or any monitor-enumeration API at startup -
+  it used cached window coords from its saved layout (e.g.
+  `NtUserCreateWindowEx x=676, y=390, cx=1208, cy=634`). Likely fixed
+  incidentally by a prior wine patch, or never an issue when Fusion has
+  a saved layout file. Re-open if the bug shows on a fresh-install /
+  no-saved-state path.
 
 ### Open - Win32-side / Fusion-side, not winewayland
 
