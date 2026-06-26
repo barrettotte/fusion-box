@@ -34,20 +34,25 @@ log "make -j$(nproc) in $BUILD_DIR"
 ( cd "$BUILD_DIR" && make -j"$(nproc)" 2>&1 | tail -20 )
 
 log "copying rebuilt binaries to $INSTALL_PREFIX"
-# winewayland.so is the only file we typically iterate on. cp every freshly-built .so/.so.* under build/dlls
-# and build/programs to keep things general.
-find "$BUILD_DIR/dlls" "$BUILD_DIR/programs" -name '*.so' -newer "$INSTALL_PREFIX/.fusion-box-build-stamp" \
+# Copy every freshly-built .so (Unix-side wine modules like winewayland.so)
+# AND .dll (PE-side wine builtins like dcomp.dll) into the install prefix.
+# winewayland.so lives in lib/wine/x86_64-unix/; PE DLLs live in
+# lib/wine/x86_64-windows/. We try both target dirs and copy if a file
+# with the same basename exists there. Newer than the build-stamp ensures
+# we only touch files actually changed this build.
+find "$BUILD_DIR/dlls" "$BUILD_DIR/programs" \( -name '*.so' -o -name '*.dll' \) \
+    -newer "$INSTALL_PREFIX/.fusion-box-build-stamp" \
     -print 2>/dev/null | while read f; do
 
     rel="${f#$BUILD_DIR/}"
-    # build paths look like build/dlls/winewayland.drv/winewayland.so
-    # install paths are $INSTALL_PREFIX/lib/wine/x86_64-unix/winewayland.so
     base="$(basename "$f")"
-    target="$INSTALL_PREFIX/lib/wine/x86_64-unix/$base"
-    if [ -f "$target" ]; then
-        cp -p "$f" "$target"
-        echo "  $rel -> $target"
-    fi
+    for target_dir in lib/wine/x86_64-unix lib/wine/x86_64-windows; do
+        target="$INSTALL_PREFIX/$target_dir/$base"
+        if [ -f "$target" ]; then
+            cp -p "$f" "$target"
+            echo "  $rel -> $target"
+        fi
+    done
 done
 
 log "fast rebuild done"

@@ -171,9 +171,49 @@ etc.) but cryinkfly issue #614 reports Data Panel breakage there too.
   patch 0006's vsub commit happens before Qt has actually painted the
   navbar pixels into main's shm_buffer.
 - **Data Panel (cloud projects) renders blank and main content overflows
-  window edge.** Two Chromium engines in Fusion: WebView2 (Microsoft,
-  sign-in OAuth) and Qt6WebEngineCore (Qt's Chromium wrapper, used by the
-  Data Panel).
+  window edge.**
+
+  **STATUS: RESOLVED 2026-06-26 by reinstalling Fusion in a fresh wineprefix.**
+  See `data-panel-pioneering-roadmap.md` for the full investigation arc.
+  Short version: the bug was **prefix-state pollution**, not a missing wine
+  DComp implementation. Vanilla wine 11.10 + our 10 fusion-box patches
+  renders the Data Panel fine in a fresh prefix. Earlier theories
+  (Qt6WebEngine binary patch, cross-process wayland surface sharing,
+  custom Phase D dcomp.dll, even wine-staging's full DComp impl) were
+  all chasing the wrong layer — Chromium internally cached "DComp broken"
+  state in the polluted prefix's GPU info / Edge user-data-dir / registry,
+  and once cached, never retried DComp regardless of what wine reported.
+
+  **The fix:**
+
+  ```bash
+  # Backup the polluted prefix (recoverable).
+  mv ~/.wine-fusion ~/.wine-fusion.backup-$(date +%Y%m%d-%H%M%S)
+
+  # Reinstall Fusion fresh.
+  distrobox enter fusion-box -- bash scripts/install-fusion.sh
+
+  # Launch — Data Panel now renders.
+  distrobox enter fusion-box -- bash scripts/launch-fusion.sh
+  ```
+
+  Confirmed via A/B 2026-06-26: vanilla wine 11.10 (no staging, no DComp
+  impl) + fresh prefix renders Data Panel content with thumbnails.
+  Wine-staging's 15K-line DComp impl is NOT required, just nice-to-have
+  if a future bug needs broader compat patches (USE_STAGING=1 in
+  build-wine.sh, off by default).
+
+  Original investigation kept below as historical record. The whole arc
+  was led astray by trace evidence that consistently pointed at wine's
+  DComp gap without distinguishing "wine impl missing" from "Chromium
+  internally caching the failure". The counterfactual we should have
+  set up early (fresh prefix test) would have answered the question in
+  30 minutes.
+
+  ---
+
+  Two Chromium engines in Fusion: WebView2 (Microsoft, sign-in OAuth)
+  and Qt6WebEngineCore (Qt's Chromium wrapper, used by the Data Panel).
 
   **Root cause (revised 2026-06-16, from trace
   `debug/captures/data-panel-20260615-162839.log`):** the Data Panel's
@@ -257,6 +297,26 @@ etc.) but cryinkfly issue #614 reports Data Panel breakage there too.
   notably Collabora's 2022 "Chrome works on winewayland" marketing
   claim is empirically false. cryinkfly upstream archived 2026-02-21.
   See `project_data_panel_investigation` memory for the full report.
+
+  **MAJOR REVISION 2026-06-23 (pixel-ownership trace)**: The Data
+  Panel is actually rendered by **Microsoft Edge WebView2**
+  (`msedgewebview2.exe` under `ADPWebView` path), NOT Qt6WebEngine
+  as previously assumed. Trace
+  `debug/captures/pixel-ownership-20260623-173715.log` (788 MB)
+  showed the 1273×1440 Data Panel HWND `0x901b4` and toplevel
+  container `0x40128` live in EdgeWebView pid 0f98. Wine correctly
+  creates an xdg_toplevel wayland_surface for the panel HWND (TOPLEVEL
+  role) — but **no content buffer ever commits** (only icons). KWin
+  never sends `xdg_toplevel_handle_configure` because of the missing
+  initial commit. The 6 QtWebEngineProcess subprocesses spawn but
+  handle ZERO WindowPosChanged events. The actual rendering blocker
+  is Edge WebView2's use of **DirectComposition (DComp)** for content
+  rendering — wine's DComp implementation is largely stubbed, with
+  no bridge from DComp surfaces to winewayland.drv buffer
+  attachment. All prior Qt6WebEngineCore investigation targeted the
+  wrong engine. See `docs/data-panel-pioneering-roadmap.md` for the
+  revised roadmap (Phase A obsoleted; new Phase D = wine DComp
+  bridge).
 
   **Failed attempts (do not repeat):** patch 0011 v1 (re-run role-decide
   in patch 0006's destroy branch — didn't fire, data->wayland_surface

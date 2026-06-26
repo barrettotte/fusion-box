@@ -11,6 +11,7 @@ RUN pacman-key --init && \
 # TODO: xorg-xauth, xorg-xkbcomp - remove after XWayland removed
 RUN pacman -Sy --noconfirm --needed \
         base-devel \
+        git \
         sudo \
         shadow \
         inetutils \

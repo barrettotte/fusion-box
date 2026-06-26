@@ -93,6 +93,42 @@ if [ "${FUSION_QTWE_SINGLE_PROCESS:-0}" = 1 ]; then
     export QTWEBENGINE_CHROMIUM_FLAGS="${QTWEBENGINE_CHROMIUM_FLAGS:-} --single-process"
 fi
 
+# WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: pass Chromium flags into Microsoft Edge
+# WebView2. WebView2 is the engine that actually renders Fusion's Data Panel
+# (re-attributed 2026-06-23 — was previously incorrectly attributed to Qt6WebEngine).
+#
+# Bug being addressed: Data Panel renders blank because Edge WebView2 tries to use
+# DirectComposition for content presentation, and wine's `dcomp.dll` is 100%
+# unimplemented (47-line stub returning E_NOTIMPL for every call). Trace
+# `debug/captures/pixel-ownership-20260623-173715.log` shows 7+ failed
+# `DCompositionCreateDevice*` calls. With no compositor device, WebView2 paints
+# nothing into the wayland surface wine created for the panel HWND.
+#
+# `--disable-direct-composition` tells Chromium to skip the DComp path and fall
+# back to standard HWND painting via DXGI swap chain. That path uses
+# D3D11 → DXVK → Vulkan → VK_KHR_wayland_surface → winewayland.drv buffer commit,
+# which already works under wine.
+#
+# Other flags worth combining if --disable-direct-composition alone isn't enough:
+#   --disable-gpu-compositing       (force CPU compositor)
+#   --use-angle=swiftshader         (software ANGLE)
+#   --disable-features=UseSkiaRenderer
+#
+# Opt in with FUSION_WEBVIEW2_DISABLE_DCOMP=1.
+if [ "${FUSION_WEBVIEW2_DISABLE_DCOMP:-0}" = 1 ]; then
+    export WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="${WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:-} --disable-direct-composition"
+fi
+
+# FUSION_WEBVIEW2_FORCE_SW=1: stronger fallback when --disable-direct-composition
+# alone isn't enough. Adds --disable-gpu --disable-gpu-compositing --use-gl=swiftshader
+# to force Chromium into pure-software rendering with GDI BitBlt. This path
+# bypasses DComp, ANGLE, and Vulkan entirely — Edge paints into a simple
+# bitmap that wine's GDI commits to the wayland shm buffer for the HWND.
+# Slow but should actually render.
+if [ "${FUSION_WEBVIEW2_FORCE_SW:-0}" = 1 ]; then
+    export WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="${WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:-} --disable-direct-composition --disable-gpu --disable-gpu-compositing --use-gl=swiftshader"
+fi
+
 # Most-recent Fusion360.exe under webdeploy/production.
 # Fusion auto-update lands new versions as sibling hash dirs; this picks whichever was modified last.
 FUSION_EXE=$(find "$PREFIX/drive_c/Program Files/Autodesk/webdeploy/production" \

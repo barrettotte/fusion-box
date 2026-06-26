@@ -1,0 +1,49 @@
+<!doctype html>
+<html>
+<head>
+<title>fusion-box WebView2 DComp trigger</title>
+<style>
+  body { margin: 0; background: #111; color: #eee; font-family: sans-serif; }
+  /* CSS 3D transform forces compositor layer (Chromium will hand-off to GPU) */
+  .layer { position: absolute; will-change: transform; transform: translateZ(0); }
+  #animated {
+    width: 300px; height: 300px;
+    background: linear-gradient(45deg, #f0f, #0ff);
+    border-radius: 50%;
+    top: 100px; left: 100px;
+    animation: spin 2s linear infinite;
+  }
+  @keyframes spin { from { transform: translateZ(0) rotate(0deg); } to { transform: translateZ(0) rotate(360deg); } }
+  canvas { position: absolute; top: 0; left: 400px; border: 1px solid #444; }
+  h1 { padding: 10px; }
+</style>
+</head>
+<body>
+<h1>fusion-box DComp trigger page</h1>
+<p>This page uses CSS 3D transforms + animated canvas to force Chromium GPU compositor init.</p>
+<div id="animated" class="layer"></div>
+<canvas id="canvas" width="500" height="500"></canvas>
+<script>
+// Continuous canvas animation — keeps GPU compositor active
+const c = document.getElementById('canvas');
+const ctx = c.getContext('2d');
+let t = 0;
+function frame() {
+  t += 0.02;
+  ctx.fillStyle = '#222';
+  ctx.fillRect(0, 0, 500, 500);
+  for (let i = 0; i < 20; i++) {
+    ctx.beginPath();
+    const x = 250 + Math.cos(t + i * 0.3) * 200;
+    const y = 250 + Math.sin(t + i * 0.4) * 200;
+    ctx.fillStyle = `hsl(${(t * 50 + i * 30) % 360}, 80%, 60%)`;
+    ctx.arc(x, y, 20, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  requestAnimationFrame(frame);
+}
+frame();
+console.log('test page loaded; animation running');
+</script>
+</body>
+</html>

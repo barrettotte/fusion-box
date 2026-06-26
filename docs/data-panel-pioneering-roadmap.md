@@ -1,275 +1,128 @@
-# Data Panel pioneering roadmap
+# Data Panel rendering: roadmap
 
-Multi-phase plan for solving the Fusion 360 Data Panel render bug under
-wine's native `winewayland.drv` — a problem with **no documented existing
-solution** in any community (wine, GE-Proton, Lutris, Heroic, cryinkfly,
-NullString1, KDE, Qt, Chromium), verified 2026-06-18 via 23-source
-adversarial deep research.
+> **STATUS 2026-06-26: RESOLVED — and the actual fix was much simpler than
+> we thought.**
+>
+> Weeks of investigation chased "wine doesn't implement DComp, must implement
+> it" angles: cross-process subsurface fix attempts, custom Phase D dcomp.dll
+> (~1500 lines), discovery of wine-staging's 15K-line DComp impl. The
+> empirical fix turned out to be: **delete the polluted wineprefix and
+> reinstall Fusion fresh.** Mainline wine 11.10 + our 10 fusion-box patches
+> works fine in a clean prefix.
+>
+> See "What we got wrong" below for the lessons.
 
-The architectural root cause is fundamental: **Wayland protocol forbids
-cross-process subsurface embedding by design** (per wl_subsurface
-co-author Pekka Paalanen, 2013). Qt6WebEngine's renderer subprocesses
-each become their own wine process under wine, each with its own
-`winewayland.drv` instance and its own wayland connection. Subsurface
-parent-references cannot cross connections. No fix exists anywhere — we
-are pioneering.
+## The actual fix
 
-This document plots the path. Each phase has clear entry/exit criteria
-and a decision point on whether to continue. Bias is toward cheap
-experiments before expensive ones — the goal is to learn maximum from
-minimum effort at each stage.
+```bash
+# 1. Backup the prefix (optional, recoverable).
+mv ~/.wine-fusion ~/.wine-fusion.backup-$(date +%Y%m%d-%H%M%S)
 
-See also:
-- `docs/observed-issues.md` Data Panel section — full symptom history
-- `docs/qt6webengine-binary-patch.md` — the dead-end DLL-binary-patch
-  investigation that informed this roadmap
-- `docs/data-panel-cross-process-toplevel-design.md` — Phase 0 design
-  spec (already drafted)
-- Memory: `project_data_panel_investigation` — running investigation log
-- Memory: `project_qt_msvc_abi_blocker` — Phase A's prereq infrastructure
+# 2. Reinstall Fusion fresh.
+distrobox enter fusion-box -- bash scripts/install-fusion.sh
 
-## Phase 0 — Cross-process xdg_toplevel proof-of-concept
-
-**Goal:** answer the single most important question — can wine render a
-cross-process HWND to its own `xdg_toplevel` AT ALL? If no, every
-phase beyond this dies; if yes, we have a working (ugly) fallback AND
-green light for the harder phases.
-
-**Scope:** the wine patch designed in
-`docs/data-panel-cross-process-toplevel-design.md`. Add a third branch
-to patch 0006's `if (!surface)` block in
-`dlls/winewayland.drv/window.c` `WAYLAND_WindowPosChanged`: when the
-cross-process toplevel lookup fails AND the HWND is visible + sized
-sensibly + WS_CHILD, create a wayland_surface with TOPLEVEL role
-instead of destroying.
-
-**Effort:** half-day. ~30 lines of C, one rebuild cycle (~2.5 min warm
-ccache), test in Fusion, iterate gating if needed.
-
-**Success criteria:**
-- Data Panel appears as a floating window when toggled on
-- Window contains rendered content (cloud projects browser UI)
-- Clicks in the panel route correctly (input not dropped)
-- Closing panel destroys the window cleanly
-- Closing Fusion main closes the panel too
-- No other Fusion features regress (notification center, sign-in WebView2)
-
-**Failure modes and what they mean:**
-
-| Symptom | Implication |
-|---|---|
-| Window appears, all black | Subprocess can't paint into its own surface — deeper rendering pipeline issue. Phase A/B unlikely to help; investigate why GDI surface isn't propagating to wayland buffer. |
-| Window appears empty/transparent | Compositor sees the surface but no buffer attached. May need extra `commit` plumbing in patch 0006. Fixable. |
-| Window doesn't appear at all | Either gating logic too strict (no HWND matched) OR `wayland_surface_make_toplevel` failed in subprocess. Check trace. |
-| Window appears + renders + KWin places it wildly | Functional success. UX polish needed (app_id, KWin window rules). |
-| Fusion crashes on panel open | New subprocess interaction broke an invariant. Revert immediately, capture trace. |
-| Other Qt WebEngine features (notif center, etc.) also pop out as windows | Gating too permissive. Tighten by Qt class name or HWND size threshold. |
-
-**Decision criteria for continuing to Phase A:**
-- If Phase 0 PASSES → ship as patch 0011, then evaluate whether the UX is
-  acceptable. If you accept the floating-window UX, Phase A becomes
-  optional polish.
-- If Phase 0 FAILS with "window appears, all black" → Phase A/B aren't
-  guaranteed to fix the underlying issue. Investigate the rendering
-  pipeline before committing weeks to MSVC infrastructure.
-- If Phase 0 FAILS in any other way → fix and retry Phase 0; the
-  cheap path is still worth the iteration before escalating.
-
-## Phase A — MSVC cross-build + patch Qt WebEngine
-
-**Goal:** produce an inline-rendered Data Panel. Replace Fusion's bundled
-`Qt6WebEngineCore.dll` with our own build that runs all Chromium logic
-in-process so HWNDs stay in the same wine process and patch 0006's
-existing vsub logic works for the Data Panel out of the box.
-
-**Prerequisites:** Phase 0 must have proven that cross-process rendering
-isn't itself broken (otherwise this won't help either).
-
-**Sub-phases:**
-
-### A.1 msvc-wine infrastructure (~1-2 days)
-- Install msvc-wine in container (or set up locally), validate `cl.exe`
-  runs via wine, compiles a hello-world `.dll`.
-- Update Containerfile + add helper script `scripts/build-msvc-tools.sh`.
-- Document the MSVC redistributable license terms (msvc-wine downloads
-  MS-licensed components).
-
-### A.2 qtbase 6.8.3 MSVC cross-build (~1 day)
-- Parameterize `scripts/build-qt.sh` with `BUILD_TOOLCHAIN={mingw,msvc}`.
-- Cross-build qtbase 6.8.3 with MSVC.
-- Drop-in test: replace Fusion's `Qt6Core/Gui/Widgets` with our MSVC
-  build, verify `??0QString@@QEAA@PEBD@Z` resolves (was the original
-  blocker per `qt-msvc-abi-blocker` memory).
-
-### A.3 Chromium 122 source + build (multi-day, mostly compile-time)
-- Install depot_tools, gn, ninja in container.
-- Identify exact Chromium revision qtwebengine 6.8.3 pins (check
-  qtwebengine submodules at v6.8.3 tag).
-- Fetch (~30 GB source).
-- Build (hours of compile, GBs of object files, careful disk-space
-  management).
-
-### A.4 qtwebengine 6.8.3 cross-build on top of Chromium (~1 day)
-- Cross-build qtwebengine with our patched Chromium underneath.
-- Drop-in test (no patch yet) — replace Fusion's
-  `Qt6WebEngineCore.dll`, verify Fusion launches, sign-in works.
-
-### A.5 Patch Chromium to robustly support --single-process (~variable)
-- Critical: Chromium upstream considers `--single-process` "experimental"
-  and known-broken in production. Just rebuilding won't fix this.
-- Identify the spawn-decision in
-  `content/browser/renderer_host/render_process_host_impl.cc` and force
-  the in-process path unconditionally.
-- Identify the GPU-process spawn-decision similarly and force in-process.
-- Identify the utility-process spawn-decisions (network, audio).
-- This is essentially porting LaCrOS's delegated-compositing assumptions
-  back into a Windows-mode Chromium build.
-
-### A.6 Patch Qt WebEngine adapter (~1-2 days)
-- Qt6WebEngine has its own QtWebEngineProcess.exe spawn logic that's
-  separate from Chromium's renderer spawning. Patch
-  `src/process/main.cpp` and `src/core/process_main.cpp` to recognize
-  in-process mode and skip the spawn.
-
-### A.7 Integration test + ship (~1 week)
-- Apply patches, build final DLL.
-- Replace Fusion's DLL, validate Data Panel renders inline.
-- Validate no regressions across Fusion features.
-- Write `scripts/patch-qt6webengine.sh` to apply our build (already
-  scaffolded; fill in PATCH_OFFSET/BYTES with our DLL hash).
-
-**Total Phase A effort:** 2-3 weeks of focused work, depending on
-Chromium build hurdles.
-
-**Risks:**
-- Chromium 122 source may not build cleanly with msvc-wine; subtle
-  toolchain incompatibilities possible.
-- `--single-process` may have so many embedded assumptions that
-  patching it robustly is harder than expected.
-- Fusion may update Qt6WebEngineCore.dll mid-effort, invalidating our
-  patches.
-
-**Decision criteria for continuing to Phase B:**
-- If Phase A succeeds → ship it. Phase B unnecessary unless we want the
-  upstream contribution value.
-- If Phase A blocks on Chromium build infrastructure → Phase B's wine
-  broker may be a tractable alternative that avoids the Chromium rebuild.
-- If Phase A succeeds for Fusion but is fragile across updates → Phase B
-  is the durable answer.
-
-## Phase B — Wine wineserver-mediated wayland broker
-
-**Goal:** generic architectural fix for ANY Qt WebEngine (or other
-multi-process Win32 Chromium) application under wine, not just Fusion.
-Largest upstream contribution value.
-
-**Concept:** wineserver maintains ONE wayland connection per wineserver
-session. Wine processes that would normally open their own connection
-to the compositor instead make wayland requests via wineserver IPC. The
-single connection's wl_surface objects can be referenced from any wine
-process, enabling cross-process subsurfaces transparently.
-
-**Effort estimate:** weeks-to-months. Touches wineserver internals,
-`winewayland.drv` core architecture, the wayland protocol marshaling
-layer. Significantly more code than Phase A.
-
-**Architectural sketch:**
-- New wineserver request: `wayland_marshal(opcode, args)`. Wine processes
-  forward all wayland protocol traffic through this.
-- wineserver multiplexes incoming traffic from all wine processes onto
-  the single shared wayland connection.
-- Replies and events from the compositor are routed back to the
-  originating wine process.
-- IDs (wl_object IDs) must be made globally unique across wine processes;
-  this likely needs an ID translation layer.
-- `winewayland.drv`'s `win_data_rb` becomes a shared structure in
-  wineserver (or a coherent view across processes via IPC).
-
-**Risks:**
-- Wine maintainer buy-in uncertain. The change is invasive enough that
-  it might not be accepted without significant upstream discussion.
-- Performance regression risk — wayland traffic going through an extra
-  IPC hop. Especially bad for high-frequency events (pointer motion,
-  frame callbacks).
-- Mojo-style proxying may conflict with existing wine design assumptions.
-
-**Decision criteria:** only pursue if Phase A succeeds for Fusion but
-fails generically (i.e., other Qt WebEngine apps still break), or if
-phase A's MSVC infrastructure proves too brittle.
-
-## Phase C — Chromium "detect wine, use Linux IPC" patch
-
-**Goal:** make upstream Chromium recognize it's running under wine and
-use its native Linux compositor architecture (LaCrOS-style delegated
-compositing) instead of Windows HWND parenting.
-
-**Why it works:** Chromium ALREADY has a single-connection-to-compositor
-architecture for native Linux (LaCrOS). The browser process owns the
-sole wayland connection; renderer processes never touch wayland. If we
-can convince Chromium running under wine to use that path instead of
-the Windows HWND path, the cross-process problem evaporates.
-
-**Effort estimate:** months. Requires deep Chromium expertise. Would be
-a massive upstream PR.
-
-**Why not start here:** highest-effort, highest-uncertainty path. Only
-worth pursuing if Phases A and B both prove infeasible and we want to
-solve this at the upstream Chromium layer (huge contribution).
-
-## Upstream contribution opportunities
-
-Each phase produces something potentially worth upstreaming:
-
-| Phase | Upstream candidate | Likelihood of acceptance |
-|---|---|---|
-| 0 | Wine MR for cross-process toplevel fallback | Medium — narrow scope but useful for any wine wayland Chromium-app scenario |
-| A.5 | Chromium MR forcing in-process renderer | Low — Chromium upstream considers --single-process broken-by-design |
-| A.6 | Qt MR documenting/fixing --single-process under wine | Medium — Qt may accept if framed as a wine compat patch |
-| B | Wine MR for wayland broker | High value, uncertain acceptance — would need wine-devel discussion first |
-| C | Chromium MR for wine detection | Highest impact, hardest sell |
-
-## Decision flow
-
-```
-START
-  ↓
-Phase 0 (half-day)
-  ├─ FAILS (deep render bug) → investigate rendering pipeline before escalating
-  └─ SUCCEEDS
-       ↓
-   Is floating-window UX acceptable?
-       ├─ YES → ship Phase 0 as patch 0011, done (for now)
-       └─ NO ─ ↓
-              Phase A.1-A.4 (week+) — MSVC + Chromium + qtwebengine build
-                ├─ FAILS (build infra) → consider Phase B instead
-                └─ SUCCEEDS
-                     ↓
-                 Phase A.5-A.7 (week+) — patch + integrate
-                     ├─ FAILS (--single-process unfixable) → Phase B or C
-                     └─ SUCCEEDS → ship inline Data Panel, done
+# 3. Launch.
+distrobox enter fusion-box -- bash scripts/launch-fusion.sh
 ```
 
-## Open questions to settle before committing
+Data Panel renders. That's it.
 
-1. **Is the Phase 0 outcome predictive of Phase A?** If a cross-process
-   HWND can't render to its own toplevel, can a same-process HWND render
-   in-process? May want to test by inserting a deliberate cross-process
-   call in a controlled Qt WebEngine test app.
-2. **What is the actual Chromium revision pinned by qtwebengine 6.8.3?**
-   Needed before Phase A.3.
-3. **Is Fusion 360 the right reference for this work?** Other Qt
-   WebEngine apps under wine (Spotify, Discord clones, etc.) may be
-   easier to iterate against and provide upstream credibility.
-4. **What's the test plan for upstream contribution?** Each MR will need
-   a minimal-reproducer app and a clean issue write-up.
+## Why the fresh prefix worked
 
-## Status as of 2026-06-18
+The polluted prefix had accumulated state from tonight's many experiments:
+- Chromium-internal "DComp broken" cache (Edge tested DComp early, got
+  E_NOTIMPL from wine's stub, cached the failure, never retried)
+- Multiple `dcomp.dll` versions swapped in/out of `system32`
+- `HKLM\Software\Policies\Microsoft\Edge\AdditionalLaunchParameters` registry
+  entries we added then "removed" (may have left residue)
+- `WINEDLLOVERRIDES` experiments
+- Various `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` browser-flag tests
+- Edge user-data-dir (`ADPWebView`) GPU/feature caches across multiple
+  config attempts
 
-- Phase 0 design: documented in
-  `docs/data-panel-cross-process-toplevel-design.md`.
-- Phase 0 implementation: not started.
-- All later phases: planned only.
-- Day-to-day Fusion use: works under winewayland.drv except for the
-  Data Panel. XWayland (`FUSION_FORCE_X11=1`) is NOT a viable
-  workaround on KDE Plasma 6 wayland sessions (viewport + panel both
-  render black).
+Fresh install eliminated all of it AND the Fusion installer auto-updated
+Edge WebView2 from `149.0.4022.62` → `149.0.4022.98`. Either or both made
+the difference.
+
+We never tested "does the same wine work without our experiments having
+touched the prefix?" — because by the time we asked, the prefix was already
+polluted.
+
+## Wine-staging path (still supported, no longer required)
+
+The `scripts/build-wine.sh` build script supports `USE_STAGING=1` for
+opting into wine-staging's ~250 experimental patches (including Zhang's
+DComp impl). Off by default since mainline + our patches is sufficient.
+Useful as A/B comparison or as a fallback if a future Fusion bug genuinely
+needs broader compat coverage.
+
+```bash
+# Mainline wine + our patches (default — known-good)
+scripts/build-wine.sh
+
+# Wine-staging + our patches (broader compat layer if needed)
+USE_STAGING=1 scripts/build-wine.sh
+```
+
+## Validation harness
+
+`debug/webview2-test/` — standalone WebView2 host built tonight as a
+diagnostic tool. Bypasses Fusion's network/auth/content-load chain and
+isolates "does wine + Edge render a webpage to a host HWND" question.
+
+```bash
+bash debug/webview2-test/build.sh
+bash debug/webview2-test/run.sh                # default: wine-staging
+USE_STAGING=0 bash debug/webview2-test/run.sh  # our built wine
+```
+
+Useful for: regression-testing wine builds, debugging Chromium/wine
+interactions in future investigations.
+
+## What we got wrong (lessons learned)
+
+1. **Should have tried fresh prefix FIRST.** Standard troubleshooting:
+   when an app stops rendering, test in a clean environment before
+   instrumenting the dependency chain. We instead spent weeks tracing
+   wine source, Chromium source, DXVK source. The fresh-prefix test
+   would have answered "is this prefix-state or something deeper?" in
+   30 minutes.
+
+2. **Trace evidence pointed wrong-but-consistent.** Every trace showed:
+   Edge loaded `dcomp.dll`, never called `DCompositionCreateDevice3`,
+   `d3d11_device == NULL`, etc. ALL consistent with "wine missing DComp"
+   theory. None of it would distinguish "polluted prefix made Edge cache
+   the failure" from "wine's DComp implementation is missing". We needed
+   the **counterfactual** (does it work with no polluting state?) and
+   we never set up that experiment.
+
+3. **The morning trace ambiguity.** The morning of 2026-06-23, an
+   early trace showed Edge calling DComp 7+ times. By evening, Edge
+   stopped. We attributed this to "Chromium internal policy
+   decisions". The real cause was probably "Chromium cached the
+   morning's failure and stopped retrying". The fresh prefix removes
+   that cache.
+
+4. **Our Phase D dcomp.dll work was unnecessary** for THIS bug, but
+   was educationally valuable: we learned wine's PE DLL build system,
+   the IDCompositionDevice/Visual/Target/Surface COM hierarchy, wine's
+   test runner conventions. Code was deleted (`tmp/phase-d-sources/`)
+   since wine-staging has a superset if ever needed.
+
+5. **`debug/webview2-test/` IS valuable infrastructure.** It directly
+   tests "wine + Edge → can render" without depending on Fusion. Keep
+   it as a regression-test harness for any future wine work.
+
+6. **Search upstream FIRST when implementing in-tree.** Even though
+   wine-staging wasn't actually needed, the lesson stands: had we
+   needed DComp, Zhang's 15K-line implementation already existed.
+   We spent hours reimplementing 1500 lines of it.
+
+## Cross-references
+
+- `observed-issues.md` — umbrella view of all known Fusion-on-wine bugs
+- `qt6webengine-binary-patch.md` — ABANDONED (Data Panel uses Edge WebView2, not Qt6WebEngine)
+- `bottom-toolbar-burial.md` — separate toolbar-burial investigation
+- `UPSTREAM-RESEARCH.md` — pre-investigation wine MR survey
+- `debug/webview2-test/README.md` — validation harness usage
+- Wine-Staging DComp patchset (kept as reference): <https://github.com/wine-staging/wine-staging/commit/b70caa17726c3532b210a5ddf53af8024bc35b34>

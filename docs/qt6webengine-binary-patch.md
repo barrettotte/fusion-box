@@ -1,5 +1,20 @@
 # Qt6WebEngineCore.dll binary patch investigation
 
+> **STATUS: ABANDONED 2026-06-26.** This path was based on the
+> hypothesis that the Data Panel render bug was a Qt6WebEngine
+> regression introduced by Autodesk in a 2026-06-12 update. Subsequent
+> investigation (see `data-panel-pioneering-roadmap.md` and project
+> memory) established that the Data Panel is rendered by **Edge
+> WebView2** (not Qt6WebEngine), and that the actual fix is
+> **switching to wine-staging**, which includes Zhiyi Zhang's 65-patch
+> DirectComposition implementation. Qt6WebEngine sign-in path is fine
+> and unaffected.
+>
+> Keeping this doc as research history — the methodology (probing
+> bundled DLLs, Ghidra analysis, mtime audit) is reusable for any
+> future binary-patching work. Specific findings about Qt6WebEngine
+> internals are not actionable.
+
 Investigation log for the Data Panel render bug, pursuing the
 binary-patch path (option 4a from `observed-issues.md`'s Data Panel
 entry). Goal: locate and reverse a change Autodesk introduced in their
