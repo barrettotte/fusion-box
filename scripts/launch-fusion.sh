@@ -70,6 +70,20 @@ export QT_ENABLE_HIGHDPI_SCALING=0
 export QT_AUTO_SCREEN_SCALE_FACTOR=0
 export QT_SCALE_FACTOR=1
 
+# QT_QPA_UPDATE_IDLE_TIME=0: disable Qt's paint-coalescing idle window.
+#
+# Qt normally waits a short idle period (default 4ms) before dispatching
+# a batch of paint events, to let more update() calls accumulate. When
+# Fusion opens onto a smaller/secondary monitor, its viewport paint loop
+# fires only ~6 parent commits total during launch and then goes
+# quiescent — if patch 0006's nav-toolbar vsub hadn't yet attached a
+# parent buffer with the toolbar merged in, it stays showing an empty
+# (black) region. Setting the idle time to 0 forces Qt to dispatch
+# paints immediately, giving the vsub enough commits to catch a good
+# frame. Verified 2026-07-02: fixes navbar-black-on-secondary-monitor
+# with no observed regressions, including cross-monitor drag.
+export QT_QPA_UPDATE_IDLE_TIME=0
+
 # QTWEBENGINE_CHROMIUM_FLAGS: collapse Qt6WebEngineCore's multi-process Chromium
 # architecture into a single process. Diagnostic-only opt-in (FUSION_QTWE_SINGLE_PROCESS=1).
 #
