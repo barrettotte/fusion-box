@@ -2,6 +2,20 @@
 # Virtual subsurface for Qt6 WS_CHILD widgets that paint into the toplevel's
 # GDI buffer ("GDI-buffer slice promotion").
 #
+# Iteration 2 (2026-07-02): freeze vsub commits during toplevel resize.
+# Fixes intermittent white/black flash of the nav toolbar during window
+# resize / maximize. Qt sends transient WAYLAND_WindowPosChanged events
+# for the toolbar HWND with intermediate positions (e.g. mid-toplevel
+# instead of bottom-center) while mid-relayout; empirically these
+# transients survive 5+ consecutive frames so per-child streak-based
+# hysteresis is unreliable. Instead we track the TOPLEVEL's own size
+# across parent commits and skip the vsub commit loop until the toplevel
+# size has been stable for 3 consecutive commits. During the freeze,
+# vsubs retain their last-attached buffer per wayland protocol, so the
+# toolbar visually stays at the last stable position until layout
+# settles. See docs/observed-issues.md patch 0006 entry for the trace
+# analysis that led to this iteration.
+#
 # Bug:
 # Fusion 360's center-bottom navigation toolbar (orbit/pan/zoom/fit/etc.) is a
 # Qt6 WS_CHILD widget (`Qt683QWindowIcon`) that paints its pixels into the
@@ -90,7 +104,7 @@
 #
 --- a/dlls/winewayland.drv/waylanddrv.h
 +++ b/dlls/winewayland.drv/waylanddrv.h
-@@ -401,13 +401,24 @@
+@@ -401,13 +401,39 @@
      BOOL is_fullscreen;
      BOOL managed;
      BOOL layered_attribs_set;
@@ -105,6 +119,21 @@
 +     * attached to. Cached so set_window_surface_contents can find virtual
 +     * subsurface children of a given toplevel without walking the Win32 tree. */
 +    HWND virtual_toplevel;
++    /* fusion-box (patch 0006 iteration 2): freeze vsub commits during
++     * toplevel resize. Rationale: Qt's Win32 QPA plugin sends transient
++     * WAYLAND_WindowPosChanged events for the toolbar HWND with intermediate
++     * positions while re-laying out after a toplevel size change (empirically
++     * up to 5+ consecutive frames with the same wrong position, so streak-
++     * based hysteresis is unreliable). Committing the vsub crop with those
++     * transient coords pulls the wrong region of the parent buffer (usually
++     * viewport white). We instead track the toplevel's own size and freeze
++     * ALL vsub commits until the toplevel size has been stable for a few
++     * frames. During the freeze, vsubs keep their previously-attached buffer
++     * (wayland surfaces retain their last attached buffer until re-attached),
++     * so the toolbar stays visible at the last stable position. Only meaningful
++     * on wayland_win_data entries whose wayland_surface has TOPLEVEL role. */
++    RECT last_toplevel_screen_rect;
++    int  toplevel_stable_count;
  };
  
  struct wayland_win_data *wayland_win_data_get(HWND hwnd);
@@ -266,7 +295,7 @@
      BOOL committed = FALSE;
  
      if (!(data = wayland_win_data_get(hwnd))) return FALSE;
-@@ -1034,6 +1153,135 @@
+@@ -1034,6 +1153,167 @@
          }
      }
  
@@ -301,6 +330,29 @@
 +                         parent_surf->role == WAYLAND_SURFACE_ROLE_TOPLEVEL;
 +        if (NtUserGetWindowRect(hwnd, &toplevel_rect, 0))
 +        {
++            /* fusion-box (patch 0006 iter 2): freeze vsub commits during
++             * toplevel resize. Track the toplevel's own size across parent
++             * commits — Qt sends transient toolbar rects while mid-relayout
++             * after a size change, which produces the white/black flash.
++             * By waiting for the toplevel size to stabilize across a few
++             * commits before running the vsub loop, we skip the transients
++             * entirely; vsubs keep their previously-attached buffers, so the
++             * toolbar visually stays at the last stable position until
++             * layout settles. Threshold: 3 stable commits (empirically the
++             * transient window is 5 commits, so 3 is a safety margin). */
++            BOOL toplevel_size_stable;
++            if (EqualRect(&toplevel_rect, &data->last_toplevel_screen_rect))
++                data->toplevel_stable_count++;
++            else
++            {
++                data->last_toplevel_screen_rect = toplevel_rect;
++                data->toplevel_stable_count = 0;
++            }
++            toplevel_size_stable = data->toplevel_stable_count >= 3;
++            if (!toplevel_size_stable)
++                TRACE("[fusion-box-vsub] freeze parent_commit hwnd=%p: toplevel resizing (stable_count=%d)\n",
++                    hwnd, data->toplevel_stable_count);
++
 +            RB_FOR_EACH_ENTRY(child, &win_data_rb, struct wayland_win_data, entry)
 +            {
 +                struct wayland_surface *cs;
@@ -368,6 +420,15 @@
 +                {
 +                    TRACE("[fusion-box-vsub] commit skip hwnd=%p: out-of-bounds local=(%d,%d %dx%d) buf=%dx%d\n",
 +                        child->hwnd, sx, sy, sw, sh, shm_buffer->width, shm_buffer->height);
++                    skipped++; continue;
++                }
++
++                /* fusion-box (patch 0006 iter 2): freeze during toplevel resize.
++                 * See last_toplevel_screen_rect field comment in waylanddrv.h. */
++                if (!toplevel_size_stable)
++                {
++                    TRACE("[fusion-box-vsub] commit skip hwnd=%p: toplevel resizing (would commit src=(%d,%d %dx%d))\n",
++                        child->hwnd, sx, sy, sw, sh);
 +                    skipped++; continue;
 +                }
 +
