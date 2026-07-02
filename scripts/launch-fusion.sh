@@ -186,32 +186,35 @@ if [ "${FUSION_PREWARM_IDM:-1}" = 1 ]; then
     fi
 fi
 
-# FUSION_QT_TEXT_ENGINE (default: gdi):
+# FUSION_QT_TEXT_ENGINE (default: freetype):
 #   Qt 6.8 switched to DirectWrite as the default text engine on Windows
 #   (see qt.io/blog "Qt 6.8 Released" — DirectWrite becomes default for
 #   faster font-database init). Fusion 360 bundles Qt 6.8.x, so
-#   DirectWrite is the default. Wine's dwrite.dll has gaps in glyph
-#   shaping and outline delivery — the visible symptom is malformed
-#   glyphs in tooltips ("Press Pull" → broken P's, "Configuration Table"
-#   → broken T and fi ligature). Splash-screen text (which goes through
-#   plain GDI) renders fine, confirming wine's GDI font engine is
-#   healthy.
+#   DirectWrite is the default in-app.
 #
-#   `-platform windows:nodirectwrite` forces Qt back to the GDI font
-#   engine. This is a Qt-side CLI arg parsed by QGuiApplication.
-#   Verified 2026-07-02 as the root cause via +font,+text trace:
-#   tooltip text never hit NtGdiExtTextOutW under the DirectWrite
-#   default; only glyph-index lookups reached wine.
+#   Under wine, each engine has a different failure mode:
+#     directwrite: wine's dwrite has gaps → malformed P, T, and fi
+#                  ligature glyphs in tooltips
+#     gdi:         tooltips render cleanly, but capital I is dropped
+#                  (zero-advance) from menu items. Every Fusion menu
+#                  entry starting with "Insert…" shows as "nsert…".
+#     freetype:    all letters render, P/T/I fine, fi ligature is very
+#                  mildly weird (cosmetic, not broken)
 #
-#   Values: gdi (default, applies the workaround) | directwrite (Qt 6.8+
-#   default, retains the bug) | freetype (uses Qt's bundled FreeType).
-FUSION_QT_TEXT_ENGINE="${FUSION_QT_TEXT_ENGINE:-gdi}"
+#   Default is `freetype` because missing capital I in every menu item
+#   is much worse UX than a slightly-weird fi ligature in tooltips.
+#   Verified 2026-07-02 via +font,+text trace + A/B testing across all
+#   three engines.
+#
+#   Values: freetype (default) | gdi | directwrite (diagnostic only,
+#   reproduces the original P/T/fi bug).
+FUSION_QT_TEXT_ENGINE="${FUSION_QT_TEXT_ENGINE:-freetype}"
 case "$FUSION_QT_TEXT_ENGINE" in
+    freetype)    QT_PLATFORM_ARG="windows:fontengine=freetype" ;;
     gdi)         QT_PLATFORM_ARG="windows:nodirectwrite" ;;
     directwrite) QT_PLATFORM_ARG="" ;;
-    freetype)    QT_PLATFORM_ARG="windows:fontengine=freetype" ;;
-    *)           echo "WARN: unknown FUSION_QT_TEXT_ENGINE=$FUSION_QT_TEXT_ENGINE, using default"
-                 QT_PLATFORM_ARG="windows:nodirectwrite" ;;
+    *)           echo "WARN: unknown FUSION_QT_TEXT_ENGINE=$FUSION_QT_TEXT_ENGINE, using default freetype"
+                 QT_PLATFORM_ARG="windows:fontengine=freetype" ;;
 esac
 
 cd "$(dirname "$FUSION_EXE")"

@@ -67,7 +67,7 @@ Override defaults via env:
 | `WINE_BIN=...` | use a different wine binary (e.g., a GE-Proton variant) |
 | `FUSION_FORCE_X11=1` | route through XWayland for diagnosis only |
 | `FUSION_PREWARM_IDM=0` | skip the IDSDK prewarm step in the launcher |
-| `FUSION_QT_TEXT_ENGINE=gdi\|directwrite\|freetype` | which Qt text engine to use. Default `gdi` passes `-platform windows:nodirectwrite` — required workaround for Qt 6.8's DirectWrite default, which produces malformed glyphs (P, T, `fi`) under wine's `dwrite.dll`. Set `=directwrite` to reproduce the bug for diagnosis. |
+| `FUSION_QT_TEXT_ENGINE=freetype\|gdi\|directwrite` | which Qt text engine to use. Default `freetype` uses Qt's bundled FreeType — every letter renders, fi ligature is mildly cosmetic. `gdi` renders tooltips cleanly but drops capital I from every menu item ("Insert…" → "nsert…"). `directwrite` (Qt 6.8's Windows default) produces malformed P/T/fi under wine's `dwrite.dll` and is diagnostic-only. |
 | `FUSION_QTWE_SINGLE_PROCESS=1` | pass `--single-process` to `Qt6WebEngineCore` (Chromium). Diagnostic only — Qt WebEngine strips subprocess flags, so this is effectively a no-op today. |
 | `FUSION_WEBVIEW2_DISABLE_DCOMP=1` | pass `--disable-direct-composition` to Edge WebView2. Historically used to work around Fusion's Data Panel; the panel is now resolved by fresh-prefix reinstall (see `docs/observed-issues.md`). |
 | `FUSION_WEBVIEW2_FORCE_SW=1` | force WebView2 pure-software renderer (`--disable-gpu --disable-gpu-compositing --use-gl=swiftshader`). Same context as `_DISABLE_DCOMP`. |
