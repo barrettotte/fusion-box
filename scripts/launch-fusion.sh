@@ -186,5 +186,37 @@ if [ "${FUSION_PREWARM_IDM:-1}" = 1 ]; then
     fi
 fi
 
+# FUSION_QT_TEXT_ENGINE (default: gdi):
+#   Qt 6.8 switched to DirectWrite as the default text engine on Windows
+#   (see qt.io/blog "Qt 6.8 Released" — DirectWrite becomes default for
+#   faster font-database init). Fusion 360 bundles Qt 6.8.x, so
+#   DirectWrite is the default. Wine's dwrite.dll has gaps in glyph
+#   shaping and outline delivery — the visible symptom is malformed
+#   glyphs in tooltips ("Press Pull" → broken P's, "Configuration Table"
+#   → broken T and fi ligature). Splash-screen text (which goes through
+#   plain GDI) renders fine, confirming wine's GDI font engine is
+#   healthy.
+#
+#   `-platform windows:nodirectwrite` forces Qt back to the GDI font
+#   engine. This is a Qt-side CLI arg parsed by QGuiApplication.
+#   Verified 2026-07-02 as the root cause via +font,+text trace:
+#   tooltip text never hit NtGdiExtTextOutW under the DirectWrite
+#   default; only glyph-index lookups reached wine.
+#
+#   Values: gdi (default, applies the workaround) | directwrite (Qt 6.8+
+#   default, retains the bug) | freetype (uses Qt's bundled FreeType).
+FUSION_QT_TEXT_ENGINE="${FUSION_QT_TEXT_ENGINE:-gdi}"
+case "$FUSION_QT_TEXT_ENGINE" in
+    gdi)         QT_PLATFORM_ARG="windows:nodirectwrite" ;;
+    directwrite) QT_PLATFORM_ARG="" ;;
+    freetype)    QT_PLATFORM_ARG="windows:fontengine=freetype" ;;
+    *)           echo "WARN: unknown FUSION_QT_TEXT_ENGINE=$FUSION_QT_TEXT_ENGINE, using default"
+                 QT_PLATFORM_ARG="windows:nodirectwrite" ;;
+esac
+
 cd "$(dirname "$FUSION_EXE")"
-exec "$WINE_BIN" Fusion360.exe "$@"
+if [ -n "$QT_PLATFORM_ARG" ]; then
+    exec "$WINE_BIN" Fusion360.exe -platform "$QT_PLATFORM_ARG" "$@"
+else
+    exec "$WINE_BIN" Fusion360.exe "$@"
+fi

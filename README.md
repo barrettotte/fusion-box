@@ -33,15 +33,9 @@ Also I'm honestly just curious how in the world to get this to work given my sel
 - **Minimal host changes.** One `.desktop` file for the OAuth callback. No host packages, no host wine, no host wineprefix.
 - **No prebuilt binaries shipped.** All wine patches as `.patch` files applied at build time. No prebuilt DLLs.
 
-## Status (early)
-
-Sign-in works end-to-end (host browser OAuth -> `adskidmgr://` -> IDM -> SLM session). Main UI loads. Ribbon, browser dock, viewport, sketches, extrudes work. 
-**Several rendering bugs remain** - see "Known Issues" below for the short list and `docs/observed-issues.md` for full diagnoses with patch-level attribution.
-
 ## Quick start
 
-Run everything from the repo root (`cd` into your clone first). `distrobox enter` preserves the host CWD inside the container, 
-so relative paths work for both host and container commands.
+Run everything from the repo root. `distrobox enter` preserves the host CWD inside the container, so relative paths work for both host and container commands.
 
 ```bash
 # One-time: build the container image and create the distrobox.
@@ -73,9 +67,18 @@ Override defaults via env:
 | `WINE_BIN=...` | use a different wine binary (e.g., a GE-Proton variant) |
 | `FUSION_FORCE_X11=1` | route through XWayland for diagnosis only |
 | `FUSION_PREWARM_IDM=0` | skip the IDSDK prewarm step in the launcher |
+| `FUSION_QT_TEXT_ENGINE=gdi\|directwrite\|freetype` | which Qt text engine to use. Default `gdi` passes `-platform windows:nodirectwrite` — required workaround for Qt 6.8's DirectWrite default, which produces malformed glyphs (P, T, `fi`) under wine's `dwrite.dll`. Set `=directwrite` to reproduce the bug for diagnosis. |
+| `FUSION_QTWE_SINGLE_PROCESS=1` | pass `--single-process` to `Qt6WebEngineCore` (Chromium). Diagnostic only — Qt WebEngine strips subprocess flags, so this is effectively a no-op today. |
+| `FUSION_WEBVIEW2_DISABLE_DCOMP=1` | pass `--disable-direct-composition` to Edge WebView2. Historically used to work around Fusion's Data Panel; the panel is now resolved by fresh-prefix reinstall (see `docs/observed-issues.md`). |
+| `FUSION_WEBVIEW2_FORCE_SW=1` | force WebView2 pure-software renderer (`--disable-gpu --disable-gpu-compositing --use-gl=swiftshader`). Same context as `_DISABLE_DCOMP`. |
+| `WINEPREFIX_FUSION=...` | override the wineprefix path used by `install-fusion.sh` and `launch-fusion.sh` (default `~/.wine-fusion`). |
 | `WINE_INSTALL_PREFIX=...` | install patched wine elsewhere (default `~/wine-versions/wine-11.10-fusion`) |
 | `BOX_HOME=...` | (passed to `build-container.sh`) bind-mount this dir as the container's `$HOME` |
 | `BUILD_WINE_FORCE=1` | (passed to `build-wine.sh`) force re-extract source tarball and re-apply all patches from scratch, even if the build stamp matches. Use after editing `patches/wine/*.patch` to verify the canonical chain still applies and produces a working binary. ~5 min cold build. |
+| `BUILD_QT_FORCE=1` | (passed to `build-qt.sh`) force re-fetch + rebuild of Qt 6.8.3 from scratch. Only relevant if you are working on `patches/qt/*.patch` — the standard Fusion path does not use the Qt build. |
+| `MAX_PATCH_NUM=N` | (passed to `build-wine.sh`) only apply patches 0001..N. Set `MAX_PATCH_NUM=0` for vanilla wine 11.10. Useful for regression bisects. |
+| `USE_STAGING=1` | (passed to `build-wine.sh`) build atop wine-staging (Zhang's DComp impl + broader compat backports) instead of vanilla wine 11.10. Not required for current Fusion functionality — the Data Panel renders on vanilla wine in a fresh prefix — but kept as a fallback for future compat work. |
+| `USE_CCACHE=0` | (passed to `build-wine.sh`) skip the ccache wrapping around CC / x86_64_CC. Default is on when `ccache` is present; wraps save ~4 min on warm rebuilds. |
 | `WINE_WORK_TREE=...` | (passed to `build-wine-fast.sh`) rsync `winewayland.drv/` from this tree into the cached source before rebuilding. Use when iterating on patches outside the cache. |
 
 ### Iterating on the wine patches
@@ -93,29 +96,22 @@ distrobox enter fusion-box -- bash -lc 'BUILD_WINE_FORCE=1 bash scripts/build-wi
 
 ## Known Issues
 
-- **Navigation toolbar missing** - renders underneath the modeling viewport. 
-  Root cause documented in `docs/observed-issues.md` and `docs/bottom-toolbar-burial.md`: 
-  each QRhi-backed Qt6 widget gets its own `wayland_client_surface` as a sibling subsurface of main; 
-  main's GDI buffer (where the nav toolbar's pixels live) is always below its subsurfaces by Wayland protocol. 
-  No wine-only fix possible without a fundamental rework of the wine `window_surface <-> wayland_surface` coupling.
-- Object browser, comment menu, and ribbon tooltips disappear after maximize.
-- Clicking on object browser makes mouse disappear temporarily (move away and back in to fix). Suspect cursor-shape race in `wayland_pointer.c`.
 - Popups / dialogs stay visible when parent toplevel is minimized. Limitation of xdg-shell (no minimize event) - wine doesn't propagate `WM_SHOWWINDOW SW_PARENTCLOSING` to owned popups.
 - Horizontal window resize leaves echo / artifact trails. Vertical clean.
 - Dialogs / popups cut off text vertically.
-- Font rendering issue (Push/Pull the "P" looks wrong).
+- Bottom timeline vanishes and navbar renders blank-white on vertical shrink (top-edge-down or bottom-edge-up drag). Grow direction is clean. Root cause is Qt's deferred-layout timing vs. wine's per-commit subsurface positioning; wine-side spikes exhausted (see `docs/observed-issues.md`).
+- Data Panel (cloud projects) blank on a POLLUTED prefix from prior experimentation. Fix: reinstall Fusion into a fresh wineprefix. Fresh installs render fine.
 
 See `docs/observed-issues.md` for full diagnosis, attempted-but-failed fixes, and reference to upstream wine MRs touching each area.
 
 ## TODO
 
-- Investigate Qt6-side fix for the navigation toolbar root cause (per `docs/bottom-toolbar-burial.md`)
 - progress bars for install/build or more logging for user feedback
 - combine `build-wine.sh` and `build-wine-fast.sh`, use a `--fast` flag
 - use `COPY` for repo instead of symlinked reference
 
 Tests:
-- Test general CAD workflows
+- Test general CAD
 - Test CAM samples
 - Test Electronics samples
 - Test Design samples
