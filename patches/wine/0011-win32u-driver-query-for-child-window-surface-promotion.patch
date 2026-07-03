@@ -1,0 +1,118 @@
+# fusion-box wine patch 0011
+# win32u: driver query for WS_CHILD window_surface promotion.
+#
+# Wine core normally denies every WS_CHILD widget a driver-provided
+# window_surface — children share the parent's DIB via wine's default
+# offscreen memory-DIB path (get_default_window_surface). This is fine
+# for the traditional Win32 model where child widgets paint into the
+# parent's client-area GDI.
+#
+# For winewayland.drv's patch 0006 refactor, that assumption falls apart.
+# Patch 0006 promotes specific Qt6 WS_CHILD widgets (the nav toolbar and
+# similar small overlays that Qt paints via QRhi but doesn't back with a
+# DXVK client_surface) to a virtual wl_subsurface — needed because
+# main's GDI buffer is at the BOTTOM of the toplevel's subsurface tree
+# per wayland protocol, so anything Qt paints into main's DIB is
+# obscured by DXVK-swapchain sibling subsurfaces.
+#
+# Previous incarnations of patch 0006 attached the TOPLEVEL's shm_buffer
+# to the vsub with a wp_viewport crop at the child's rect. That works
+# when Qt's parent-chain paint routing successfully merges the child's
+# pixels all the way up into the toplevel's DIB before the flush — and
+# it breaks in a family of Fusion-layout-change bugs that don't (Data
+# Panel toggle, secondary-monitor launches with sparse parent commits,
+# etc.). The correct architectural fix is to attach the CHILD's OWN
+# shm_buffer to the vsub, which requires wine to give the child a
+# driver-provided window_surface in the first place.
+#
+# This patch adds an opt-in query, pShouldPromoteChildSurface(HWND), to
+# the user_driver interface. The nulldrv default returns FALSE, which
+# preserves the historical behavior for every non-promoted child in
+# every driver (winex11.drv, winemac.drv, others). Only drivers that
+# both implement pShouldPromoteChildSurface AND return TRUE for a
+# specific HWND cause wine to fall through into the surface-creation
+# path for that WS_CHILD. winewayland.drv's implementation lives in
+# patch 0012.
+#
+# Files changed:
+#   include/wine/gdi_driver.h — add pShouldPromoteChildSurface to
+#     struct user_driver_funcs, next to the existing pCreateWindowSurface.
+#   dlls/win32u/driver.c — add nulldrv_ShouldPromoteChildSurface stub
+#     returning FALSE, wire it into the driver func-table and
+#     SET_USER_FUNC macro fallback so every non-implementing driver
+#     inherits the safe default automatically.
+#   dlls/win32u/window.c — change the WS_CHILD gate in get_window_surface
+#     from unconditional `needs_surface = FALSE` to
+#     `needs_surface = FALSE unless driver promotes this HWND`.
+#
+# Apply from the wine source root: `patch -p1 < this-file`.
+# Independent of the winewayland.drv patches — this is a pure
+# core-interface addition. Depends on nothing before it and does not
+# alter behavior for any driver until they implement the new query.
+#
+# Author: fusion-box (claude-code session, with Barrett Otte)
+#
+--- a/include/wine/gdi_driver.h	2026-05-29 16:04:32.000000000 -0400
++++ b/include/wine/gdi_driver.h	2026-07-02 21:15:58.055910070 -0400
+@@ -421,6 +421,7 @@
+     BOOL    (*pGetWindowStyleMasks)(HWND,UINT,UINT,UINT*,UINT*);
+     BOOL    (*pGetWindowStateUpdates)(HWND,UINT*,UINT*,RECT*,HWND*);
+     BOOL    (*pCreateWindowSurface)(HWND,BOOL,const RECT *,struct window_surface**);
++    BOOL    (*pShouldPromoteChildSurface)(HWND);
+     void    (*pMoveWindowBits)(HWND,const struct window_rects *,const struct window_rects *,const RECT *);
+     void    (*pWindowPosChanged)(HWND,HWND,HWND,UINT,const struct window_rects*,struct window_surface*);
+     /* system parameters */
+--- a/dlls/win32u/driver.c	2026-05-29 16:04:32.000000000 -0400
++++ b/dlls/win32u/driver.c	2026-07-02 21:16:58.811907647 -0400
+@@ -884,6 +884,17 @@
+     return FALSE;
+ }
+ 
++/* fusion-box (patch 0011): drivers may promote a WS_CHILD widget to have its
++ * own driver-provided window_surface. Default: do not promote. Used by
++ * winewayland.drv's patch 0006 to give Qt6 WS_CHILD widgets that get a
++ * virtual subsurface their own wayland-backed shm_buffer for direct paint
++ * routing. Preserves default WS_CHILD painting behavior for every other
++ * driver and every other widget. */
++static BOOL nulldrv_ShouldPromoteChildSurface( HWND hwnd )
++{
++    return FALSE;
++}
++
+ static void nulldrv_MoveWindowBits( HWND hwnd, const struct window_rects *old_rects,
+                                     const struct window_rects *new_rects, const RECT *valid_rects )
+ {
+@@ -1303,6 +1314,7 @@
+     nulldrv_GetWindowStyleMasks,
+     nulldrv_GetWindowStateUpdates,
+     nulldrv_CreateWindowSurface,
++    nulldrv_ShouldPromoteChildSurface,
+     nulldrv_MoveWindowBits,
+     nulldrv_WindowPosChanged,
+     /* system parameters */
+@@ -1402,6 +1414,7 @@
+     SET_USER_FUNC(GetWindowStyleMasks);
+     SET_USER_FUNC(GetWindowStateUpdates);
+     SET_USER_FUNC(CreateWindowSurface);
++    SET_USER_FUNC(ShouldPromoteChildSurface);
+     SET_USER_FUNC(MoveWindowBits);
+     SET_USER_FUNC(WindowPosChanged);
+     SET_USER_FUNC(SystemParametersInfo);
+--- a/dlls/win32u/window.c	2026-05-29 16:04:32.000000000 -0400
++++ b/dlls/win32u/window.c	2026-07-02 21:17:11.115907157 -0400
+@@ -2138,7 +2138,14 @@
+     else monitor_rects = map_window_rects_virt_to_raw( *rects, get_thread_dpi() );
+ 
+     if (!user_driver->pWindowPosChanging( hwnd, swp_flags, shaped, &monitor_rects )) needs_surface = FALSE;
+-    else if (is_child) needs_surface = FALSE;
++    /* fusion-box (patch 0011): children normally never get a driver-provided
++     * window_surface (they share their parent's DIB). But winewayland.drv's
++     * patch 0006 needs a wayland-backed shm_buffer for specific Qt6 WS_CHILD
++     * widgets that have been "promoted" to a virtual subsurface — that
++     * buffer is what its patch 0006 refactor attaches to the wl_subsurface.
++     * The driver query defaults to FALSE (nulldrv), preserving legacy
++     * behavior for every non-promoted child in every other driver. */
++    else if (is_child && !user_driver->pShouldPromoteChildSurface( hwnd )) needs_surface = FALSE;
+     else if (swp_flags & SWP_HIDEWINDOW) needs_surface = FALSE;
+     else if (swp_flags & SWP_SHOWWINDOW) needs_surface = TRUE;
+     else needs_surface = !!(style & WS_VISIBLE);

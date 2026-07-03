@@ -1,0 +1,298 @@
+# fusion-box wine patch 0012
+# winewayland.drv: promote patch 0006 vsub children to own
+# wayland-backed shm_buffer + attach-child's-own-buffer flush path.
+#
+# Requires patch 0011 (the driver-interface query).
+#
+# Problem this fixes:
+# Patch 0006's older "attach TOPLEVEL's shm_buffer with wp_viewport crop"
+# path breaks whenever Fusion's layout change disrupts Qt's child→toplevel
+# DIB merge chain. Reproducers:
+#   1. Data Panel toggle: opens/closes push the navbar to a new
+#      parent-local position; the parent's shm_buffer at the crop
+#      coords no longer contains the toolbar pixels (they got painted
+#      into an intermediate widget's DIB that isn't merged all the way
+#      up). Result: partial toolbar with white where the rest should be.
+#   2. Launch to smaller secondary monitor: Fusion fires ~6 parent
+#      commits total before going quiescent; if Qt hadn't painted the
+#      toolbar by then, the vsub stays showing an empty (black) region
+#      forever.
+#
+# Fix:
+# Attach the CHILD's OWN shm_buffer directly to the wl_subsurface (no
+# crop, no dependence on the parent's DIB state). Requires wine to give
+# the child a driver-provided window_surface, gated by patch 0011's
+# pShouldPromoteChildSurface hook.
+#
+# Implementation:
+#   - WAYLAND_ShouldPromoteChildSurface(hwnd): replicates patch 0006's
+#     eligibility check (WS_CHILD + toolbar-sized + toplevel-with-wayland-
+#     surface + no own client_surface). NOT gated on WS_VISIBLE because
+#     wine calls this from WindowPosChanging, before the style has been
+#     updated for the incoming SetWindowPos change — SWP_SHOWWINDOW handling
+#     downstream in wine's else-if chain reaches the right decision if we
+#     return TRUE here.
+#   - Registered as .pShouldPromoteChildSurface in waylanddrv_funcs.
+#   - set_window_surface_contents: for any SUBSURFACE-role surface
+#     matching the promotion eligibility (toolbar-shaped WS_CHILD), (a)
+#     update wl_subsurface_set_position from the current Win32 rects
+#     each flush — wine's own wayland_surface_reconfigure_subsurface
+#     path is gated by processing.serial and only fires once per
+#     xdg-config cycle, which never re-triggers for pure position
+#     shifts, so we own the position update path; (b) install an empty
+#     input region on the wl_surface so clicks fall through to the
+#     toplevel wl_surface (wine's Win32 cursor-position routing finds
+#     the toolbar HWND correctly there — without empty input the
+#     subsurface claims events but downstream WM message queueing
+#     never fires, empirically zero WM_LBUTTONDOWN reaches Qt).
+#   - Also: SKIP the old parent-crop iteration in the toplevel's
+#     set_window_surface_contents for children with virtual_toplevel
+#     set. Their own-buffer flush path now covers rendering; running
+#     both would race and let the parent-crop overwrite the child's
+#     own commit.
+#
+# Iteration history in this session:
+#   - Initial attempt: checked data->virtual_buffer to gate the
+#     position update. Wrong — patch 0006 clears virtual_buffer=FALSE
+#     when the promoted child hits wayland_win_data_create_wayland_surface
+#     (the normal wine path, not the vsub CREATED path). Fixed by
+#     checking role + toolbar-shaped size instead.
+#   - Second attempt: my set_position + no input-region change.
+#     Position correct but zero WM messages queued for the toolbar.
+#     Added empty input region.
+#   - Third attempt: dropped my set_position (thought wine's internal
+#     path was sufficient). Position regressed — wine's own path fires
+#     once and doesn't reapply, so pure-position shifts don't update.
+#     Restored my set_position on every flush.
+#   - Current: set_position from every flush + empty input region on
+#     every flush + skip parent-crop iteration for virtual_toplevel
+#     children.
+#
+# Verified 2026-07-02 on Fusion 360 with fresh container + fresh
+# wineprefix: navbar renders at correct bottom-center, click routing
+# works, Data Panel toggle no longer breaks it.
+#
+# Author: fusion-box (claude-code session, with Barrett Otte)
+#
+--- a/dlls/winewayland.drv/waylanddrv.h	2026-07-02 22:07:31.058538740 -0400
++++ b/dlls/winewayland.drv/waylanddrv.h	2026-07-02 21:22:47.678893737 -0400
+@@ -549,6 +549,7 @@
+                               const struct window_rects *new_rects, struct window_surface *surface);
+ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects);
+ BOOL WAYLAND_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface);
++BOOL WAYLAND_ShouldPromoteChildSurface(HWND hwnd);
+ UINT WAYLAND_VulkanInit(UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs);
+ UINT WAYLAND_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs);
+ BOOL WAYLAND_GetWindowStyleMasks( HWND hwnd, UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask );
+--- a/dlls/winewayland.drv/waylanddrv_main.c	2026-07-02 22:07:31.039584190 -0400
++++ b/dlls/winewayland.drv/waylanddrv_main.c	2026-07-02 21:22:33.428894305 -0400
+@@ -53,6 +53,10 @@
+     .pWindowPosChanged = WAYLAND_WindowPosChanged,
+     .pWindowPosChanging = WAYLAND_WindowPosChanging,
+     .pCreateWindowSurface = WAYLAND_CreateWindowSurface,
++    /* fusion-box (patch 0012): promote patch 0006 virtual subsurface children
++     * to have their own wayland-backed window_surface — see the function's
++     * docstring in window.c for the "why". */
++    .pShouldPromoteChildSurface = WAYLAND_ShouldPromoteChildSurface,
+     .pVulkanInit = WAYLAND_VulkanInit,
+     .pOpenGLInit = WAYLAND_OpenGLInit,
+     .pGetWindowStyleMasks = WAYLAND_GetWindowStyleMasks,
+--- a/dlls/winewayland.drv/window.c	2026-07-02 22:07:31.056624019 -0400
++++ b/dlls/winewayland.drv/window.c	2026-07-02 22:01:16.644801672 -0400
+@@ -668,6 +668,93 @@
+ }
+ 
+ /***********************************************************************
++ *           WAYLAND_ShouldPromoteChildSurface
++ *
++ * fusion-box (patch 0012): tells wine core (via patch 0011's driver-interface
++ * hook) that a specific WS_CHILD HWND should get its own wayland-backed
++ * window_surface — i.e., its own shm_buffer, damage tracking, and set_window_surface_contents
++ * flush hook — even though it's a child. This is required for patch 0006's
++ * virtual subsurface refactor: attaching the CHILD's OWN shm_buffer to the
++ * vsub means Fusion's layout changes (Data Panel open, secondary monitor,
++ * anything that disrupts child→toplevel DIB merging) can no longer starve
++ * the vsub of correct pixels.
++ *
++ * Eligibility MUST be checked here independently — pShouldPromoteChildSurface
++ * fires from wine's get_window_surface during pWindowPosChanging, which is
++ * BEFORE our WAYLAND_WindowPosChanged decide function has had a chance to set
++ * data->virtual_buffer. We replicate the same size/style/parent gating rather
++ * than querying that flag.
++ *
++ * Default (nulldrv): FALSE. Preserves legacy WS_CHILD painting for every
++ * other driver and every other widget.
++ */
++BOOL WAYLAND_ShouldPromoteChildSurface(HWND hwnd)
++{
++    struct wayland_win_data *tdata, *cdata;
++    UINT style;
++    RECT rect;
++    HWND toplevel;
++    int w, h;
++    BOOL eligible = FALSE;
++    const char *reject = NULL;
++
++    style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
++    /* NB: intentionally NOT gating on WS_VISIBLE. Wine's caller
++     * (get_window_surface in win32u/window.c) invokes this from
++     * WindowPosChanging, before the style has been updated to reflect the
++     * incoming SetWindowPos change. If SWP_SHOWWINDOW is set on the call,
++     * wine's own else-if chain sets needs_surface=TRUE after ours returns —
++     * but only if we return TRUE here first. Gating on WS_VISIBLE would
++     * make us return FALSE on the exact SHOWWINDOW call that promotes the
++     * child. */
++    if (!(style & WS_CHILD)) reject = "no WS_CHILD";
++
++    if (!reject && !NtUserGetWindowRect(hwnd, &rect, 0)) reject = "GetWindowRect failed";
++    if (!reject)
++    {
++        w = rect.right - rect.left;
++        h = rect.bottom - rect.top;
++        if (w <= 0 || h <= 0 || w > 1000 || h > 50)
++            reject = "size out of toolbar gate";
++    }
++
++    if (!reject)
++    {
++        toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
++        if (!toplevel || toplevel == hwnd) reject = "no toplevel ancestor";
++    }
++
++    if (!reject)
++    {
++        if (!(tdata = wayland_win_data_get(toplevel))) reject = "toplevel has no wayland_win_data";
++        else
++        {
++            if (!tdata->wayland_surface) reject = "toplevel wayland_surface=NULL";
++            else if (tdata->wayland_surface->role != WAYLAND_SURFACE_ROLE_TOPLEVEL) reject = "toplevel wrong role";
++            /* NB: no check on tdata->client_surface here. Patch 0006 does not
++             * gate on that either — the toplevel occasionally holds a
++             * client_surface pointer during transient states, and rejecting
++             * here would skip promotion of otherwise-eligible children. */
++            else if ((cdata = wayland_win_data_get(hwnd)))
++            {
++                if (cdata->client_surface) reject = "child has client_surface";
++                else eligible = TRUE;
++                wayland_win_data_release(cdata);
++            }
++            else reject = "child has no wayland_win_data";
++            wayland_win_data_release(tdata);
++        }
++    }
++
++    if (eligible)
++        TRACE("[fusion-box-vsub] promote hwnd=%p (style=%#x size=%dx%d)\n", hwnd, style, w, h);
++    else
++        TRACE("[fusion-box-vsub] no-promote hwnd=%p style=%#x: %s\n", hwnd, style, reject ? reject : "unknown");
++
++    return eligible;
++}
++
++/***********************************************************************
+  *           WAYLAND_WindowPosChanging
+  */
+ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects)
+@@ -1223,6 +1310,79 @@
+     {
+         if (wayland_surface_reconfigure(wayland_surface))
+         {
++            /* fusion-box (patch 0012): if this flush is for a virtual_buffer
++             * promoted child, update its wl_subsurface_set_position from the
++             * current parent-local rect BEFORE attaching the child's own
++             * shm_buffer. This replaces patch 0006's old crop-of-parent path
++             * for the promoted class of children — we now attach the child's
++             * OWN shm_buffer straight to the subsurface, so no viewport crop
++             * is needed. wayland_surface_reconfigure_subsurface's own
++             * set_position path is gated on processing.serial (xdg config
++             * cycle) which our virtual subsurfaces don't hit — hence we set
++             * position here explicitly. */
++            /* fusion-box (patch 0012): for promoted vsub-eligible SUBSURFACE
++             * children, ensure the wl_subsurface position tracks the child's
++             * current Win32 rect on every paint, AND install an empty input
++             * region so clicks fall through to the parent toplevel (where
++             * wine's cursor-position routing finds the toolbar HWND
++             * correctly). Wine's own wayland_surface_reconfigure_subsurface
++             * fires only once per xdg-config cycle (gated by
++             * processing.serial) which never re-triggers for pure position
++             * shifts, so we own the position update path.
++             *
++             * The empty input region MUST be installed here (not just in
++             * patch 0006 CREATED) because wine's normal wayland_win_data_create_wayland_surface
++             * path does not install one; without it, the wl_surface claims
++             * input, wine's pointer.c delivers events to the toolbar HWND
++             * via pointer_handle_button, but downstream WM message queueing
++             * never fires (empirically zero WM_LBUTTONDOWN reaches Qt).
++             * With empty input, wayland routes to the toplevel wl_surface
++             * instead → wine finds the toolbar via cursor-position lookup
++             * → WM messages queue → Qt handles clicks. */
++            if (wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE &&
++                wayland_surface->wl_subsurface && wayland_surface->wl_surface)
++            {
++                UINT style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
++                RECT child_rect;
++                if ((style & WS_CHILD) &&
++                    NtUserGetWindowRect(hwnd, &child_rect, 0))
++                {
++                    int w = child_rect.right - child_rect.left;
++                    int h = child_rect.bottom - child_rect.top;
++                    /* Same toolbar-shaped gate as pShouldPromoteChildSurface. */
++                    if (w > 0 && h > 0 && w <= 1000 && h <= 50)
++                    {
++                        HWND toplevel = data->virtual_toplevel ? data->virtual_toplevel :
++                                        (wayland_surface->toplevel_hwnd ? wayland_surface->toplevel_hwnd :
++                                         NtUserGetAncestor(hwnd, GA_ROOT));
++                        RECT toplevel_rect;
++                        if (toplevel && toplevel != hwnd &&
++                            NtUserGetWindowRect(toplevel, &toplevel_rect, 0))
++                        {
++                            int win_x = child_rect.left - toplevel_rect.left;
++                            int win_y = child_rect.top - toplevel_rect.top;
++                            int surf_x, surf_y;
++                            wayland_surface_coords_from_window(wayland_surface, win_x, win_y, &surf_x, &surf_y);
++                            wl_subsurface_set_position(wayland_surface->wl_subsurface, surf_x, surf_y);
++                            TRACE("[fusion-box-vsub] child_own_buffer hwnd=%p wl_subsurface_id=%u win_pos=(%d,%d) surf_pos=(%d,%d) buf=%dx%d\n",
++                                hwnd,
++                                wl_proxy_get_id((struct wl_proxy *)wayland_surface->wl_subsurface),
++                                win_x, win_y, surf_x, surf_y,
++                                shm_buffer->width, shm_buffer->height);
++                        }
++
++                        {
++                            struct wl_region *empty = wl_compositor_create_region(process_wayland.wl_compositor);
++                            if (empty)
++                            {
++                                wl_surface_set_input_region(wayland_surface->wl_surface, empty);
++                                wl_region_destroy(empty);
++                            }
++                        }
++                    }
++                }
++            }
++
+             wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
+             wl_surface_commit(wayland_surface->wl_surface);
+             committed = TRUE;
+@@ -1313,6 +1473,22 @@
+                     skipped++;
+                     continue;
+                 }
++
++                /* fusion-box (patch 0012): patch 0011's ShouldPromoteChildSurface
++                 * gives every virtual_buffer child its own wayland-backed
++                 * window_surface. That surface's flush hits our
++                 * set_window_surface_contents(child, ...) directly, attaching
++                 * the child's OWN shm_buffer to the vsub. The parent-crop
++                 * path below is therefore no-op'd for promoted children —
++                 * running both would race and let the parent's stale/empty
++                 * region overwrite the child's own commit each parent flush.
++                 * The teardown check above still runs; only the commit path
++                 * is skipped. */
++                {
++                    TRACE("[fusion-box-vsub] skip parent-crop for hwnd=%p (child own-buffer path)\n", child->hwnd);
++                    skipped++;
++                    continue;
++                }
+ 
+                 if (!(cs = child->wayland_surface))
+                 {

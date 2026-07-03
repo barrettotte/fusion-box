@@ -99,7 +99,7 @@ distrobox enter fusion-box -- bash -lc 'BUILD_WINE_FORCE=1 bash scripts/build-wi
 - Popups / dialogs stay visible when parent toplevel is minimized. Limitation of xdg-shell (no minimize event) - wine doesn't propagate `WM_SHOWWINDOW SW_PARENTCLOSING` to owned popups.
 - Horizontal window resize leaves echo / artifact trails. Vertical clean.
 - Dialogs / popups cut off text vertically.
-- Bottom timeline vanishes and navbar renders blank-white on vertical shrink (top-edge-down or bottom-edge-up drag). Grow direction is clean. Root cause is Qt's deferred-layout timing vs. wine's per-commit subsurface positioning; wine-side spikes exhausted (see `docs/observed-issues.md`).
+- Bottom timeline vanishes and navbar renders blank-white on vertical shrink (top-edge-down or bottom-edge-up drag). Grow direction is clean. Root cause is Qt's deferred-layout timing vs. wine's per-commit subsurface positioning; wine-side spikes exhausted (see `docs/observed-issues.md`). May be helped by patches 0011+0012 too — re-verify.
 - Data Panel (cloud projects) blank on a POLLUTED prefix from prior experimentation. Fix: reinstall Fusion into a fresh wineprefix. Fresh installs render fine.
 
 See `docs/observed-issues.md` for full diagnosis, attempted-but-failed fixes, and reference to upstream wine MRs touching each area.
