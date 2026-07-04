@@ -87,20 +87,14 @@
 #     toplevel is minimized" (dialog subclass fix - transient popups
 #     still exhibit the bug by design).
 
---- a/dlls/winewayland.drv/window.c	2026-07-03 15:58:47.308493422 -0400
-+++ b/dlls/winewayland.drv/window.c	2026-07-03 18:01:55.335266561 -0400
-@@ -398,7 +398,81 @@
+--- a/dlls/winewayland.drv/window.c	2026-07-03 20:36:32.044745139 -0400
++++ b/dlls/winewayland.drv/window.c	2026-07-03 20:38:40.235751752 -0400
+@@ -367,7 +367,59 @@
          }
      }
  
-+    /* fusion-box: extend owner detection to catch NON-WS_POPUP dialogs that
-+     * still have an owner. Patch 0004's WS_POPUP block only fires when
-+     * style has WS_POPUP set - Fusion's Export dialog (opened via the
-+     * WebView2 UI layer) is WS_OVERLAPPEDWINDOW-style with an owner, so
-+     * it falls through to a bare xdg_toplevel: no set_parent -> minimize
-+     * doesn't propagate, no decoration protocol request -> KWin renders
-+     * a stripped-down SSD titlebar. Detect the owner here and hand it
-+     * back to the is_owned_dialog check below. */
++    /* fusion-box: owner-walk for non-WS_POPUP dialogs (patch 0004 only
++     * catches WS_POPUP). See patch 0013 header. */
 +    if (visible && !popup_parent_surface && !toplevel_surface &&
 +        !(style & WS_CHILD))
 +    {
@@ -125,36 +119,20 @@
 +
 +    }
 +
-+    /* fusion-box: Owned dialogs (owner has a live xdg_toplevel) go to
-+     * xdg_toplevel with xdg_toplevel_set_parent instead of xdg_popup or
-+     * bare toplevel. Rationale:
-+     *   - xdg_popup has no minimize semantics; when the compositor minimizes
-+     *     the parent (KWin's SSD titlebar, Alt+F9, taskbar), the popup keeps
-+     *     rendering and floats above other host apps. Wine can't observe the
-+     *     minimize (xdg-shell configure has no MINIMIZED bit) so no
-+     *     driver-side propagation is possible.
-+     *   - xdg_toplevel with set_parent: compositor per xdg-shell spec
-+     *     stacks the child above the parent and hides/minimizes it with the
-+     *     parent. Free minimize propagation.
-+     * Catch: WS_POPUP dialogs (like Preferences) with WS_CAPTION - but
-+     * ALSO non-WS_POPUP dialogs (like Export) that have an owner - all
-+     * flow through here now. Menus / tooltips are WS_POPUP without
-+     * WS_CAPTION -> still take the xdg_popup path via patch 0004. */
++    /* fusion-box: owned dialogs → xdg_toplevel + set_parent so KWin
++     * propagates minimize (unlike xdg_popup). WS_CAPTION filters out
++     * menus/tooltips; non-WS_POPUP catches WS_OVERLAPPEDWINDOW dialogs.
++     * See patch 0013 header. */
 +    BOOL is_owned_dialog = popup_parent_surface &&
 +                           popup_parent_surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
 +                           popup_parent_surface->xdg_toplevel &&
 +                           ((style & WS_CAPTION) == WS_CAPTION ||
 +                            !(style & WS_POPUP));
 +
-+    /* fusion-box: TOPLEVEL<->POPUP role-thrash dampener for owned dialogs.
-+     * Qt periodically re-invokes SetWindowPos with SWP_FRAMECHANGED /
-+     * SWP_STATECHANGED during dialog setup. On those calls WS_CAPTION can
-+     * be transiently missing, or popup_parent_surface's cached xdg_toplevel
-+     * pointer can be nil for a tick. Without a latch this destroys and
-+     * recreates the wl_surface as xdg_popup and loses the set_parent
-+     * relationship. Latch: if surface is currently TOPLEVEL and still has
-+     * an owner HWND, stay TOPLEVEL. set_parent is re-issued below when
-+     * popup_parent_surface is fully live. */
++    /* fusion-box: TOPLEVEL↔POPUP role-thrash dampener — Qt's mid-setup
++     * SWP_FRAMECHANGED cycles transiently drop WS_CAPTION or nil the
++     * parent xdg_toplevel; keep TOPLEVEL if we already had one and an
++     * owner is still resolvable. See patch 0013 header. */
 +    if (!is_owned_dialog && data->wayland_surface &&
 +        data->wayland_surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
 +        popup_owner_hwnd && popup_owner_hwnd != data->hwnd)
@@ -171,15 +149,11 @@
      else if (popup_parent_surface) role = WAYLAND_SURFACE_ROLE_POPUP;
      else if (toplevel_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
      else role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
-@@ -468,6 +542,19 @@
+@@ -419,6 +471,15 @@
          break;
      case WAYLAND_SURFACE_ROLE_TOPLEVEL:
          wayland_surface_make_toplevel(surface, get_mwm_decoration(data));
-+        /* fusion-box: for owned dialogs (see is_owned_dialog above), tell the
-+         * compositor about the parent relationship so it can propagate
-+         * minimize/hide from parent to child. Without this, dialogs like
-+         * Preferences persist on-screen (and above host apps) after the
-+         * parent is minimized via the compositor's own titlebar / shortcut. */
++        /* fusion-box: set_parent so KWin propagates minimize. See patch 0013. */
 +        if (is_owned_dialog && surface->xdg_toplevel &&
 +            popup_parent_surface && popup_parent_surface->xdg_toplevel)
 +        {

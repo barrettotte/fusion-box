@@ -48,48 +48,30 @@
 #
 # Apply from the wine source root: `patch -p1 < this-file`
 #
---- a/dlls/winewayland.drv/wayland_surface.c
-+++ b/dlls/winewayland.drv/wayland_surface.c
-@@ -829,7 +829,19 @@
+
+--- a/dlls/winewayland.drv/wayland_surface.c	2026-07-03 18:21:17.484738837 -0400
++++ b/dlls/winewayland.drv/wayland_surface.c	2026-07-03 18:22:40.613330804 -0400
+@@ -662,7 +662,9 @@
      if (client->wl_subsurface)
      {
          wl_subsurface_set_position(client->wl_subsurface, x, y);
 -        wl_subsurface_place_above(client->wl_subsurface, surface->wl_surface);
-+        /* fusion-box: do NOT re-place_above on every reconfigure. Each call
-+         * to wl_subsurface_place_above(sub, ref) puts `sub` immediately
-+         * above `ref` in the parent's stack; when multiple sibling client
-+         * subsurfaces all reconfigure against the same toplevel anchor
-+         * (which happens on every xdg_toplevel.configure event - i.e. every
-+         * focus/resize/state change), the iteration order determines z-order
-+         * and prior callers get pushed UP the stack, making the FIRST-called
-+         * subsurface end up topmost. For apps with multiple overlapping
-+         * sibling Win32 children (Autodesk Fusion 360, anything Qt
-+         * QStackedWidget-style), this produces the visible-topmost subsurface
-+         * shuffling on every focus change. The initial subsurface creation
-+         * already places it correctly; the wayland compositor maintains
-+         * relative z-order until an explicit reorder. Let it. */
++        /* fusion-box: don't re-place_above on every reconfigure — sibling
++         * subsurfaces sharing an anchor thrash each other's z-order. Initial
++         * placement sticks. See patch 0002 header. */
      }
-
+ 
      if (width != 0 && height != 0)
-@@ -908,10 +920,17 @@
+@@ -741,10 +743,8 @@
          TRACE("hwnd=%p pos=%d,%d\n", surface->hwnd, x, y);
-
+ 
          wl_subsurface_set_position(surface->wl_subsurface, x, y);
 -        if (toplevel_data->client_surface)
 -            wl_subsurface_place_above(surface->wl_subsurface, toplevel_data->client_surface->wl_surface);
 -        else
 -            wl_subsurface_place_above(surface->wl_subsurface, toplevel_surface->wl_surface);
-+        /* fusion-box: place_above intentionally removed from the reconfigure
-+         * path. Every wl_subsurface_place_above(sub, ref) puts `sub`
-+         * IMMEDIATELY above `ref` per Wayland spec - when multiple sibling
-+         * subsurfaces all reconfigure against the same toplevel/client anchor
-+         * (which Fusion 360 does constantly), the last caller wins and every
-+         * other sibling gets pushed one layer down. Empirically this buries
-+         * static UI overlays like Fusion's bottom toolbar (subsurface stays
-+         * placed where it was last set, but other surfaces keep promoting
-+         * themselves above it on every paint). The initial subsurface
-+         * creation already places it correctly; the wayland compositor
-+         * maintains relative z-order until an explicit reorder. We let it. */
++        /* fusion-box: place_above intentionally omitted — same rationale as
++         * the client-subsurface hunk above. See patch 0002 header. */
          wl_surface_commit(toplevel_surface->wl_surface);
-
+ 
          memset(&surface->processing, 0, sizeof(surface->processing));

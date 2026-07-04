@@ -1,18 +1,14 @@
 #!/bin/bash
-# Build the fusion-box container image and create the distrobox.
+# Build the fusion-box image and create the distrobox.
 #
 # Usage:
-#   ./build-container.sh                 # build + create with no extras
-#   ./build-container.sh --nvidia        # build + create with NVIDIA GPU
+#   ./build-container.sh                 # build + create
+#   ./build-container.sh --nvidia        # + NVIDIA GPU
 #   ./build-container.sh --recreate      # destroy existing container first
 #
-# Env vars (optional):
-#   BOX_HOME=/path/to/dir   bind-mount this dir as the container's $HOME instead of the host $HOME.
-#                           Useful for isolating Fusion's wineprefix + wine builds from the rest of $HOME
-#                           (so you can wipe / back up / share separately).
-#                           Equivalent to passing `--home $BOX_HOME` to `distrobox create`.
-#
-# Any extra args (other than --recreate) are passed through to `distrobox create`.
+# BOX_HOME=/path (optional): use as container's $HOME instead of host $HOME,
+# to isolate the wineprefix + wine builds. Equivalent to --home $BOX_HOME.
+# Extra args (except --recreate) are passed through to `distrobox create`.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -30,7 +26,7 @@ for arg in "$@"; do
     esac
 done
 
-# Translate BOX_HOME into a --home flag. If the user passed --home explicitly, their flag wins and we don't add a duplicate.
+# BOX_HOME → --home. Explicit --home in args wins.
 if [ -n "${BOX_HOME:-}" ]; then
     if printf '%s\n' "${PASS_ARGS[@]}" | grep -qx -- '--home'; then
         echo "==> Both BOX_HOME and --home given; --home wins"

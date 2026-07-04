@@ -8,17 +8,13 @@ export WINEPREFIX="$PREFIX"
 export WINEARCH=win64
 export WINEDEBUG="${WINEDEBUG:-fixme-all,err-winediag}"
 
-# Kill any prior wine session before launching to avoid Fusion's "Multiple instances are not supported" dialog and
-# clear orphaned msedgewebview2 / IDM / cer_dialog / wineserver processes.
-# wineserver -k brings down the current session, but Autodesk's CER dialog and stray WebView2 children sometimes
-# survive in a detached process tree - pkill by exe name catches those.
+# Kill any prior session — Fusion refuses to run a second instance, and
+# WebView2/CER children survive a plain wineserver -k in a detached tree.
 pkill -9 -f cer_dialog 2>/dev/null || true
 pkill -9 -f msedgewebview2 2>/dev/null || true
 pkill -9 -f Fusion360.exe 2>/dev/null || true
 pkill -9 -f AdskIdentityManager.exe 2>/dev/null || true
 
-# Now bring down every wineserver we might have used (container system wine, GE-Proton variants,
-# side-by-side builds under ~/wine-versions/).
 wineserver -k 2>/dev/null || true
 for ws in "$HOME"/wine-versions/*/bin/wineserver "$HOME"/wine-versions/*/usr/bin/wineserver; do
     [ -x "$ws" ] && "$ws" -k 2>/dev/null || true
@@ -26,28 +22,17 @@ done
 sleep 2
 
 # WINEDLLOVERRIDES:
-#   bcp47langs=        - IDM (AdskIdentityManager.exe) calls the unimplemented bcp47langs.dll!GetUserLanguages export.
-#                        Without this override, wine aborts the entire process before IDM can finish init. cf.
-#                        wine MR !6131, cryinkfly issue #432.
-#   winewayland.drv=b  - Use wine's native Wayland driver instead of winex11.drv.
-#     winex11.drv=       Without this, wine paints through winex11 -> XWayland and the Qt6 sign-in dialog
-#                        (and any subsequent Qt-rendered window) shows up as a uniform-black rectangle.
-#                        Diagnosed 2026-06-06; confirmed on wine-staging 10.11 AND GE-Proton 10-34.
-#                        Native winewayland.drv renders correctly. Set FUSION_FORCE_X11=1 to fall back to X11.
+#   bcp47langs=       — IDM's GetUserLanguages import is unimplemented; without
+#                       this override wine aborts before IDM inits.
+#   winewayland.drv=b — native Wayland driver (XWayland renders Qt6 as black).
+#                       FUSION_FORCE_X11=1 falls back for diagnostics.
 DRIVER_OVERRIDE='winewayland.drv=b;winex11.drv='
 if [ "${FUSION_FORCE_X11:-0}" = 1 ]; then
-    # Diagnostic-only escape hatch: force winex11.drv (XWayland). Tested 2026-06-07 - confirms most UI bugs
-    # are wayland-specific (X11 path has working dock/toolbar/popups but the viewport goes black under DXVK).
-    # NOT the goal - fusion-box's mission is to pioneer the wayland+vulkan path. Use only when isolating whether a bug is wayland-side.
     DRIVER_OVERRIDE='winewayland.drv=;winex11.drv=b'
 fi
 export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}${DRIVER_OVERRIDE:+$DRIVER_OVERRIDE;}bcp47langs="
 
-# Wine binary. Preference order:
-#   1. $WINE_BIN if set
-#   2. The patched build from scripts/build-wine.sh (adds winewayland SSD support;
-#      see patches/wine/0001-winewayland-server-side-decorations.patch)
-#   3. Container's system wine-staging
+# Wine binary: $WINE_BIN > patched build from build-wine.sh > system wine.
 PATCHED_WINE="$HOME/wine-versions/wine-11.10-fusion/bin/wine"
 if [ -n "${WINE_BIN:-}" ]; then
     :
@@ -57,94 +42,37 @@ else
     WINE_BIN="wine"
 fi
 
-# winebrowser.exe (used by any wine ShellExecute("https://...")) checks $BROWSER first, then a hard-coded list
-# of /usr/bin/<browser> paths. None exist in this image, so without BROWSER set, AdskIdentityManager's OAuth
-# redirect silently does nothing. Point at our xdg-open shim -> distrobox-host-exec -> host browser.
+# winebrowser needs $BROWSER set — its default /usr/bin/<browser> paths don't
+# exist in this image, so IDM's OAuth redirect silently fails without this.
 export BROWSER=/usr/local/bin/xdg-open
 
-# Force Qt6 to scale 1:1 with physical pixels. Wine's wayland multi-monitor DPI handling confuses Qt's hover-driven
-# cursor-shape updates if Qt is left to auto-scale per screen - the cursor visually stays as whatever it was on
-# enter and never changes when hovering different widgets. Disabling Qt's HiDPI scaling pins everything to 1.0 and
-# the cursor shape updates as expected. Fusion's UI on a 4K-class monitor will be small but legible.
+# Force Qt6 to 1:1 pixel scale. Wine's multi-monitor DPI handling breaks
+# Qt's hover-driven cursor-shape updates when auto-scaling per screen.
 export QT_ENABLE_HIGHDPI_SCALING=0
 export QT_AUTO_SCREEN_SCALE_FACTOR=0
 export QT_SCALE_FACTOR=1
 
-# QT_QPA_UPDATE_IDLE_TIME=0: disable Qt's paint-coalescing idle window.
-#
-# Qt normally waits a short idle period (default 4ms) before dispatching
-# a batch of paint events, to let more update() calls accumulate. When
-# Fusion opens onto a smaller/secondary monitor, its viewport paint loop
-# fires only ~6 parent commits total during launch and then goes
-# quiescent — if patch 0006's nav-toolbar vsub hadn't yet attached a
-# parent buffer with the toolbar merged in, it stays showing an empty
-# (black) region. Setting the idle time to 0 forces Qt to dispatch
-# paints immediately, giving the vsub enough commits to catch a good
-# frame. Verified 2026-07-02: fixes navbar-black-on-secondary-monitor
-# with no observed regressions, including cross-monitor drag.
+# Disable Qt's 4ms paint-coalescing idle. On a secondary monitor Fusion
+# quiesces after ~6 parent commits — with the default idle, patch 0006's
+# vsub can miss the toolbar merge and stay black. See navbar-black-secondary-monitor.
 export QT_QPA_UPDATE_IDLE_TIME=0
 
-# QTWEBENGINE_CHROMIUM_FLAGS: collapse Qt6WebEngineCore's multi-process Chromium
-# architecture into a single process. Diagnostic-only opt-in (FUSION_QTWE_SINGLE_PROCESS=1).
-#
-# Bug: Fusion's Data Panel (cloud projects) renders blank + offset off-screen.
-# Trace (2026-06-15) showed the Data Panel's HWND chain spans MULTIPLE wine
-# processes - Fusion main (Qt toplevel 0x1b0166 with wayland_surface) and one
-# or more QtWebEngineProcess subprocesses (each with their OWN wayland connection
-# and OWN winewayland.drv win_data_rb). When patch 0006 in the subprocess walks
-# up to find the Qt toplevel's wayland_surface, the cross-process lookup returns
-# NULL because the subprocess doesn't know about HWNDs in another process's
-# win_data_rb. Even if it did, you can't get_subsurface against another process's
-# wl_surface - wayland connections are per-process.
-#
-# --single-process forces Chromium to run renderer + GPU + browser in one
-# process. All HWNDs collapse into one wine process, patch 0006's lookup
-# succeeds, and the existing vsub eligibility may render the panel correctly.
-# Chromium upstream considers --single-process unstable for general use, so we
-# leave this off by default until we verify it doesn't break anything else
-# (sign-in WebView2 path uses a different engine and shouldn't be affected).
+# FUSION_QTWE_SINGLE_PROCESS=1: diagnostic — collapse Qt6WebEngine into one
+# process so patch 0006's cross-process HWND lookup succeeds (Data Panel).
 if [ "${FUSION_QTWE_SINGLE_PROCESS:-0}" = 1 ]; then
     export QTWEBENGINE_CHROMIUM_FLAGS="${QTWEBENGINE_CHROMIUM_FLAGS:-} --single-process"
 fi
 
-# WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: pass Chromium flags into Microsoft Edge
-# WebView2. WebView2 is the engine that actually renders Fusion's Data Panel
-# (re-attributed 2026-06-23 — was previously incorrectly attributed to Qt6WebEngine).
-#
-# Bug being addressed: Data Panel renders blank because Edge WebView2 tries to use
-# DirectComposition for content presentation, and wine's `dcomp.dll` is 100%
-# unimplemented (47-line stub returning E_NOTIMPL for every call). Trace
-# `debug/captures/pixel-ownership-20260623-173715.log` shows 7+ failed
-# `DCompositionCreateDevice*` calls. With no compositor device, WebView2 paints
-# nothing into the wayland surface wine created for the panel HWND.
-#
-# `--disable-direct-composition` tells Chromium to skip the DComp path and fall
-# back to standard HWND painting via DXGI swap chain. That path uses
-# D3D11 → DXVK → Vulkan → VK_KHR_wayland_surface → winewayland.drv buffer commit,
-# which already works under wine.
-#
-# Other flags worth combining if --disable-direct-composition alone isn't enough:
-#   --disable-gpu-compositing       (force CPU compositor)
-#   --use-angle=swiftshader         (software ANGLE)
-#   --disable-features=UseSkiaRenderer
-#
-# Opt in with FUSION_WEBVIEW2_DISABLE_DCOMP=1.
+# WebView2 fallbacks (kept for historical Data Panel investigation — see
+# project_data_panel_investigation memory. Not needed since the fresh-prefix fix).
 if [ "${FUSION_WEBVIEW2_DISABLE_DCOMP:-0}" = 1 ]; then
     export WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="${WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:-} --disable-direct-composition"
 fi
-
-# FUSION_WEBVIEW2_FORCE_SW=1: stronger fallback when --disable-direct-composition
-# alone isn't enough. Adds --disable-gpu --disable-gpu-compositing --use-gl=swiftshader
-# to force Chromium into pure-software rendering with GDI BitBlt. This path
-# bypasses DComp, ANGLE, and Vulkan entirely — Edge paints into a simple
-# bitmap that wine's GDI commits to the wayland shm buffer for the HWND.
-# Slow but should actually render.
 if [ "${FUSION_WEBVIEW2_FORCE_SW:-0}" = 1 ]; then
     export WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="${WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:-} --disable-direct-composition --disable-gpu --disable-gpu-compositing --use-gl=swiftshader"
 fi
 
-# Most-recent Fusion360.exe under webdeploy/production.
-# Fusion auto-update lands new versions as sibling hash dirs; this picks whichever was modified last.
+# Most-recent Fusion360.exe (auto-update lands versions as sibling hash dirs).
 FUSION_EXE=$(find "$PREFIX/drive_c/Program Files/Autodesk/webdeploy/production" \
     -name Fusion360.exe -printf '%T@ %p\n' 2>/dev/null \
     | sort -rn | head -1 | cut -d' ' -f2-)
@@ -155,19 +83,13 @@ if [ -z "$FUSION_EXE" ]; then
     exit 1
 fi
 
-# Pre-warm the IDSDK backend before Fusion. Wine's CreateProcess for the IDM binary takes ~15s cold-start;
-# Fusion has a hard-coded 15s timeout waiting for the SSO process to be "ready" - when wine loses the race,
-# sign-in fails with error 3213 ("Process not ready") and the user sees an "Unable to sign in" dialog blaming firewall/antivirus.
-#
-# We pre-launch IDM and poll its log file for the IPC-listening line, which is the same readiness signal Fusion's SDK probes for.
-# Polling instead of a fixed sleep means a fast cold-start doesn't waste seconds, and a slow one still completes before Fusion starts.
-#
-# Set FUSION_PREWARM_IDM=0 to opt out.
+# Pre-warm IDSDK. Wine's CreateProcess cold-start (~15s) races against
+# Fusion's 15s SSO-readiness timeout; losing gives error 3213. Polling
+# the IDM log lets a fast start not waste time. Opt out: FUSION_PREWARM_IDM=0.
 if [ "${FUSION_PREWARM_IDM:-1}" = 1 ]; then
     IDM_EXE=$(find "$PREFIX/drive_c/Program Files/Autodesk/webdeploy/production" \
         -name AdskIdentityManager.exe -print -quit 2>/dev/null)
     if [ -n "$IDM_EXE" ]; then
-        # Truncate the IDM log so our marker grep below sees only this session.
         IDM_LOG="$PREFIX/drive_c/users/$USER/AppData/Local/Autodesk/Identity Services/Log/IdServices.log"
         : >"$IDM_LOG" 2>/dev/null || true
 
@@ -178,9 +100,7 @@ if [ "${FUSION_PREWARM_IDM:-1}" = 1 ]; then
             --server_name Autodesk.IDSDK.DefaultServer-v2 \
             >/dev/null 2>&1 &
 
-        # Poll the IDM log for the IPC-server-ready marker.
-        # The line "Server:Autodesk.IDSDK.DefaultServer-v2:<pid>:<port>: Starting async call to listen for new connection"
-        # appears exactly when Fusion's SDK would succeed at connecting. Cap at 45s as a safety ceiling.
+        # Marker matches the same "IPC listening" line Fusion's SDK waits on. Cap 45s.
         READY=0
         for i in $(seq 1 90); do
             if [ -s "$IDM_LOG" ] && grep -aq "Starting async call to listen for new connection" "$IDM_LOG" 2>/dev/null; then
@@ -200,28 +120,9 @@ if [ "${FUSION_PREWARM_IDM:-1}" = 1 ]; then
     fi
 fi
 
-# FUSION_QT_TEXT_ENGINE (default: freetype):
-#   Qt 6.8 switched to DirectWrite as the default text engine on Windows
-#   (see qt.io/blog "Qt 6.8 Released" — DirectWrite becomes default for
-#   faster font-database init). Fusion 360 bundles Qt 6.8.x, so
-#   DirectWrite is the default in-app.
-#
-#   Under wine, each engine has a different failure mode:
-#     directwrite: wine's dwrite has gaps → malformed P, T, and fi
-#                  ligature glyphs in tooltips
-#     gdi:         tooltips render cleanly, but capital I is dropped
-#                  (zero-advance) from menu items. Every Fusion menu
-#                  entry starting with "Insert…" shows as "nsert…".
-#     freetype:    all letters render, P/T/I fine, fi ligature is very
-#                  mildly weird (cosmetic, not broken)
-#
-#   Default is `freetype` because missing capital I in every menu item
-#   is much worse UX than a slightly-weird fi ligature in tooltips.
-#   Verified 2026-07-02 via +font,+text trace + A/B testing across all
-#   three engines.
-#
-#   Values: freetype (default) | gdi | directwrite (diagnostic only,
-#   reproduces the original P/T/fi bug).
+# Qt text engine — Qt 6.8's DirectWrite default breaks under wine's dwrite;
+# freetype is least-broken. gdi drops capital I ("Insert" → "nsert").
+# Values: freetype (default) | gdi | directwrite (diagnostic).
 FUSION_QT_TEXT_ENGINE="${FUSION_QT_TEXT_ENGINE:-freetype}"
 case "$FUSION_QT_TEXT_ENGINE" in
     freetype)    QT_PLATFORM_ARG="windows:fontengine=freetype" ;;

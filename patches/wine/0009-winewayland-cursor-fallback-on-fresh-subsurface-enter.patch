@@ -102,63 +102,45 @@
 #
 # Author: fusion-box (claude-code session, with Barrett Otte)
 #
---- a/dlls/winewayland.drv/waylanddrv.h
-+++ b/dlls/winewayland.drv/waylanddrv.h
-@@ -122,6 +122,14 @@
+
+--- a/dlls/winewayland.drv/waylanddrv.h	2026-07-03 19:50:09.594601594 -0400
++++ b/dlls/winewayland.drv/waylanddrv.h	2026-07-03 20:02:31.656639877 -0400
+@@ -118,6 +118,10 @@
      uint32_t enter_serial;
      uint32_t button_serial;
      struct wayland_cursor cursor;
-+    /* fusion-box: last hcursor successfully applied to the pointer. Used as a
-+     * fallback in wayland_set_cursor when pointer.enter fires on an hwnd whose
-+     * data->hcursor is NULL (typically a freshly-created subsurface that Win32
-+     * hasn't called SetCursor on yet). Without this fallback, every such
-+     * enter would call wl_pointer.set_cursor with a NULL surface (hides the
-+     * cursor) before Win32 SetCursor restores it milliseconds later, producing
-+     * a visible flicker on each subsurface boundary crossing. */
++    /* fusion-box: last-applied cursor, fallback for fresh subsurfaces with
++     * data->hcursor == NULL. Prevents cursor flicker on boundary cross.
++     * See patch 0009. */
 +    HCURSOR last_hcursor;
      double accum_x;
      double accum_y;
      pthread_mutex_t mutex;
---- a/dlls/winewayland.drv/wayland_pointer.c
-+++ b/dlls/winewayland.drv/wayland_pointer.c
-@@ -760,6 +760,12 @@
+--- a/dlls/winewayland.drv/wayland_pointer.c	2026-07-03 19:49:43.339046697 -0400
++++ b/dlls/winewayland.drv/wayland_pointer.c	2026-07-03 20:03:02.930641490 -0400
+@@ -760,6 +760,9 @@
      struct wayland_win_data *data;
      double scale;
      BOOL reapply_clip = FALSE;
-+    /* fusion-box: only allow the last_hcursor fallback (below) when the caller
-+     * did NOT pass an explicit cursor. WAYLAND_SetCursor(hwnd, NULL) is Win32
-+     * explicitly asking to hide the cursor - honor that as-is. The fallback is
-+     * for the pointer_handle_enter case where use_hcursor=FALSE and the new
-+     * hwnd has no cached data->hcursor yet. */
++    /* fusion-box: fallback allowed only when caller passed no explicit
++     * cursor — WAYLAND_SetCursor(NULL) intentionally hides. See patch 0009. */
 +    BOOL fallback_to_last_hcursor = !use_hcursor;
-
+ 
      if ((data = wayland_win_data_get(hwnd)))
      {
-@@ -785,6 +791,33 @@
+@@ -780,6 +783,21 @@
      }
-
+ 
      pthread_mutex_lock(&pointer->mutex);
 +
-+    /* fusion-box: fallback for fresh subsurfaces. On pointer.enter, KWin fires
-+     * leave(old_surface)+enter(new_surface) every time the cursor crosses a
-+     * wl_subsurface boundary. wine's pointer_handle_enter calls us with
-+     * use_hcursor=FALSE expecting to use the new hwnd's cached cursor; for a
-+     * fresh subsurface (one Win32 hasn't called SetCursor on yet),
-+     * data->hcursor is NULL, and we'd otherwise send wl_pointer.set_cursor
-+     * with a NULL surface - hiding the cursor until Win32 SetCursor restores
-+     * it ~ms later. That gap is the visible flicker. Falling back to the last
-+     * cursor we successfully showed preserves continuity across the boundary. */
++    /* fusion-box: on fresh-subsurface enter with no cached cursor, borrow
++     * the last one we showed — kills the subsurface-boundary flicker.
++     * See patch 0009 header. */
 +    if (fallback_to_last_hcursor && !hcursor && pointer->last_hcursor)
 +        hcursor = pointer->last_hcursor;
 +
-+    /* fusion-box: if we have NEITHER an hwnd-cached cursor NOR a last-applied
-+     * cursor (true on the very first pointer.enter of the session), skip the
-+     * wire call entirely. Per Wayland spec, an "undefined" cursor after enter
-+     * lets the compositor display whatever it wants - KWin keeps showing the
-+     * previous cursor, which is what the user expects. Actively emitting
-+     * set_cursor(serial, nil) instead would HIDE the cursor until Win32
-+     * SetCursor fires. Only applies to the fallback path; explicit
-+     * WAYLAND_SetCursor(hwnd, NULL) from Win32 still hides (intentional). */
++    /* fusion-box: first enter of the session, no cursor known — skip the
++     * wire call rather than setting NULL (which would hide). See patch 0009. */
 +    if (fallback_to_last_hcursor && !hcursor)
 +    {
 +        pthread_mutex_unlock(&pointer->mutex);
@@ -168,15 +150,13 @@
      if (pointer->focused_hwnd == hwnd)
      {
          if ((!use_hcursor && pointer->wp_cursor_shape_device_v1) ||
-@@ -805,6 +838,11 @@
+@@ -800,6 +818,9 @@
          }
          wl_display_flush(process_wayland.wl_display);
          reapply_clip = TRUE;
 +
-+        /* fusion-box: cache the cursor we just applied for the next enter into
-+         * a fresh subsurface. Only cache non-NULL to avoid resurrecting a
-+         * stale value if Win32 has cleared it. */
++        /* fusion-box: cache for next fresh-subsurface enter fallback. */
 +        if (hcursor) pointer->last_hcursor = hcursor;
      }
      pthread_mutex_unlock(&pointer->mutex);
-
+ 

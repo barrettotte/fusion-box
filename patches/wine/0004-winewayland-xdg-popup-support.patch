@@ -66,117 +66,61 @@
 #
 # Author: fusion-box (claude-code session, with Barrett Otte)
 #
---- a/dlls/winewayland.drv/window.c
-+++ b/dlls/winewayland.drv/window.c
-@@ -234,17 +234,79 @@
- {
-     struct wayland_client_surface *client = data->client_surface;
-     struct wayland_surface *surface;
-+    struct wayland_surface *popup_parent_surface = NULL;
-+    HWND popup_owner_hwnd = 0;
-+    RECT popup_anchor_rect = {0};
-     enum wayland_surface_role role;
-     BOOL visible;
-+    DWORD style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
-     DWORD exstyle = NtUserGetWindowLongW(data->hwnd, GWL_EXSTYLE);
-     struct wl_region *input_region;
+
+--- a/dlls/winewayland.drv/waylanddrv.h	2026-07-03 18:26:51.373731854 -0400
++++ b/dlls/winewayland.drv/waylanddrv.h	2026-07-03 18:28:45.416726980 -0400
+@@ -84,6 +84,12 @@
+     WAYLAND_SURFACE_ROLE_NONE,
+     WAYLAND_SURFACE_ROLE_TOPLEVEL,
+     WAYLAND_SURFACE_ROLE_SUBSURFACE,
++    /* fusion-box: WS_POPUP windows with an owner toplevel get xdg_popup role
++     * so the compositor can position them relative to the owner via
++     * xdg_positioner. Without this, wine uses xdg_toplevel for popup menus,
++     * giving the compositor no positioning hint - popups end up wherever
++     * KWin chooses (often a different monitor entirely). */
++    WAYLAND_SURFACE_ROLE_POPUP,
+ };
  
-     TRACE("hwnd=%p\n", data->hwnd);
- 
--    visible = ((NtUserGetWindowLongW(data->hwnd, GWL_STYLE) & WS_VISIBLE) == WS_VISIBLE) &&
--               (!(exstyle & WS_EX_LAYERED) || data->layered_attribs_set);
-+    /* fusion-box: relax the WS_EX_LAYERED-without-attribs gate for WS_POPUP.
-+     * Qt6 QMenu (and Fusion's CREATE dropdown, tooltips, etc.) mark themselves
-+     * WS_EX_LAYERED purely for the drop-shadow style but render via normal
-+     * GDI/Vulkan paths - they never call SetLayeredWindowAttributes /
-+     * UpdateLayeredWindow. The original gate was meant for true layered-paint
-+     * apps that push pixels exclusively through UpdateLayeredWindow; for
-+     * popups, deferring visibility leaves them invisible forever. */
-+    visible = ((style & WS_VISIBLE) == WS_VISIBLE) &&
-+               (!(exstyle & WS_EX_LAYERED) || data->layered_attribs_set ||
-+                (style & WS_POPUP));
-+
-+    /* fusion-box: detect WS_POPUP-with-owner case before defaulting to toplevel.
-+     * A Win32 popup window with an explicit owner (set via CreateWindow's
-+     * hwndParent when WS_POPUP is in the style) should be presented as an
-+     * xdg_popup so the compositor can position it relative to the owner.
-+     * Without this, wine creates a free-floating xdg_toplevel and KWin
-+     * picks an arbitrary position (often a different monitor entirely).
-+     *
-+     * Criteria for popup role:
-+     *   - WS_POPUP set and WS_CHILD not set (true popup, not a child window)
-+     *   - Has an owner HWND (GW_OWNER), distinct from self
-+     *   - Owner has a wayland_surface with an xdg_surface (toplevel or popup) */
-+    if (visible && (style & WS_POPUP) && !(style & WS_CHILD) && !toplevel_surface)
-+    {
-+        popup_owner_hwnd = NtUserGetWindowRelative(data->hwnd, GW_OWNER);
-+        /* fusion-box: Qt6 QMenu and tooltips create WS_POPUP windows WITHOUT
-+         * setting GW_OWNER (verified empirically with Fusion's CREATE menu -
-+         * owner=NULL despite the popup belonging to the main window). Without
-+         * a parent xdg_surface, xdg_popup can't be created. Fall back to the
-+         * thread's foreground window - but ONLY if WS_EX_TOOLWINDOW is set,
-+         * which reliably distinguishes true menu-like popups from main app
-+         * windows that happen to use WS_POPUP for custom title bar styling
-+         * (Fusion's main window does this - using fg fallback on it parented
-+         * the main as a popup of a random splash window and crashed the
-+         * compositor connection). */
-+        if ((!popup_owner_hwnd || popup_owner_hwnd == data->hwnd) &&
-+            (exstyle & WS_EX_TOOLWINDOW))
-+            popup_owner_hwnd = NtUserGetForegroundWindow();
-+        if (popup_owner_hwnd && popup_owner_hwnd != data->hwnd)
+ struct wayland_keyboard
+@@ -287,6 +293,15 @@
+             struct wl_subsurface *wl_subsurface;
+             HWND toplevel_hwnd;
+         };
++        /* fusion-box: WAYLAND_SURFACE_ROLE_POPUP branch. xdg_surface (same
++         * type as in the toplevel branch above) plus xdg_popup + the HWND
++         * of the owner toplevel so we can reposition on owner moves. */
++        struct
 +        {
-+            struct wayland_win_data *owner_data =
-+                wayland_win_data_get_nolock(popup_owner_hwnd);
-+            if (owner_data && owner_data->wayland_surface &&
-+                (owner_data->wayland_surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL ||
-+                 owner_data->wayland_surface->role == WAYLAND_SURFACE_ROLE_POPUP))
-+            {
-+                popup_parent_surface = owner_data->wayland_surface;
-+                /* Anchor rect: the popup's window rect translated to
-+                 * owner-local coordinates. The popup itself sits with its
-+                 * top-left at the anchor's top-left (see make_popup). */
-+                popup_anchor_rect.left   = data->rects.window.left -
-+                    owner_data->rects.window.left;
-+                popup_anchor_rect.top    = data->rects.window.top -
-+                    owner_data->rects.window.top;
-+                popup_anchor_rect.right  = popup_anchor_rect.left + 1;
-+                popup_anchor_rect.bottom = popup_anchor_rect.top + 1;
-+            }
-+        }
-+    }
- 
-     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
-+    else if (popup_parent_surface) role = WAYLAND_SURFACE_ROLE_POPUP;
-     else if (toplevel_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
-     else role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
- 
-@@ -280,6 +342,15 @@
-     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
-         wayland_surface_make_subsurface(surface, toplevel_surface);
-         break;
-+    case WAYLAND_SURFACE_ROLE_POPUP:
-+    {
-+        int pw = data->rects.window.right - data->rects.window.left;
-+        int ph = data->rects.window.bottom - data->rects.window.top;
-+        if (pw <= 0) pw = 1;
-+        if (ph <= 0) ph = 1;
-+        wayland_surface_make_popup(surface, popup_parent_surface, &popup_anchor_rect, pw, ph);
-+        break;
-+    }
-     }
- 
-     if (visible && client) wayland_client_surface_attach(client, data->hwnd);
---- a/dlls/winewayland.drv/wayland_surface.c
-+++ b/dlls/winewayland.drv/wayland_surface.c
-@@ -60,6 +60,18 @@
++            struct xdg_surface *popup_xdg_surface;
++            struct xdg_popup *xdg_popup;
++            HWND popup_parent_hwnd;
++        };
+     };
+     struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration;
+     enum zxdg_toplevel_decoration_v1_mode decoration_mode;
+@@ -337,6 +352,13 @@
+                                       int *window_x, int *window_y);
+ struct wayland_client_surface *wayland_client_surface_create(HWND hwnd);
+ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel);
++/* fusion-box: assign xdg_popup role to `surface`, anchored to
++ * `parent_surface` (must already have an xdg_surface). `anchor_rect` is in
++ * parent's surface-local coords; popup is positioned at the anchor's
++ * top-left, extending down-right by `size`. Returns 0 on success. */
++int wayland_surface_make_popup(struct wayland_surface *surface,
++                               struct wayland_surface *parent_surface,
++                               const RECT *anchor_rect, int width, int height);
+ void wayland_surface_ensure_contents(struct wayland_surface *surface);
+ void wayland_surface_set_title(struct wayland_surface *surface, LPCWSTR title);
+ void wayland_surface_assign_icon(struct wayland_surface *surface);
+--- a/dlls/winewayland.drv/wayland_surface.c	2026-07-03 18:27:30.113345739 -0400
++++ b/dlls/winewayland.drv/wayland_surface.c	2026-07-03 18:31:17.015357444 -0400
+@@ -60,6 +60,16 @@
          surface->requested = surface->pending;
          memset(&surface->pending, 0, sizeof(surface->pending));
      }
-+    /* fusion-box: popup-role xdg_surfaces also receive configure events and
-+     * MUST be acked before any buffer commit (xdg-shell protocol error 3
-+     * otherwise). Popups have fixed geometry (we set it via xdg_positioner)
-+     * so we don't need to round-trip through WM_WAYLAND_CONFIGURE - just
-+     * ack directly here and post an expose to trigger the first paint. */
++    /* fusion-box: popup xdg_surfaces must ack the configure before any
++     * buffer commit (xdg-shell error 3 otherwise). Geometry is fixed via
++     * xdg_positioner, so ack directly and post an expose. See patch 0004. */
 +    else if (surface && surface->role == WAYLAND_SURFACE_ROLE_POPUP &&
 +             surface->popup_xdg_surface == xdg_surface)
 +    {
@@ -187,41 +131,24 @@
  
      wayland_win_data_release(data);
  
-@@ -375,6 +387,147 @@
+@@ -382,6 +392,129 @@
+     ERR("Failed to assign subsurface role to wayland surface\n");
  }
  
- /**********************************************************************
-+ *          fusion-box: xdg_popup listener + wayland_surface_make_popup
-+ *
-+ * Wine has historically created xdg_toplevel for every Win32 popup window
-+ * (WS_POPUP without WS_CHILD). xdg_toplevel has no client-side positioning
-+ * hint - the compositor decides where to place it. For popup menus,
-+ * tooltips, and floating toolbars that need to anchor near their owning
-+ * widget, this produces visibly wrong placement (popup on a different
-+ * monitor, dropdown halfway across the screen, etc.). Per the xdg-shell
-+ * spec, popups should use xdg_popup with an xdg_positioner describing the
-+ * anchor rectangle on the parent and the desired gravity. This is what
-+ * makes "click button -> menu appears below button" actually work.
-+ *
-+ * Reproducer: `wine-tests/overlap-test.c` Test 3.
-+ */
++/* fusion-box: xdg_popup listener + wayland_surface_make_popup. See
++ * patch 0004 header. Reproducer: wine-tests/overlap-test.c Test 3. */
 +static void xdg_popup_handle_configure(void *data, struct xdg_popup *xdg_popup,
 +                                       int32_t x, int32_t y,
 +                                       int32_t width, int32_t height)
 +{
 +    TRACE("hwnd=%p x=%d y=%d w=%d h=%d\n", (HWND)data, x, y, width, height);
-+    /* Compositor confirms popup position. We don't currently resize/relocate
-+     * the Win32 window in response - Fusion-style popups have fixed geometry. */
 +}
 +
 +static void xdg_popup_handle_popup_done(void *data, struct xdg_popup *xdg_popup)
 +{
 +    HWND hwnd = (HWND)data;
 +    TRACE("hwnd=%p - compositor dismissed popup\n", hwnd);
-+    /* Compositor closed the popup (e.g. user clicked outside). Tell Win32 to
-+     * destroy or hide the corresponding window so the app's state stays in
-+     * sync. Use a posted close so we don't tear down the popup from inside
-+     * the wayland event callback. */
++    /* Posted (not sent) so we don't tear down from inside the callback. */
 +    NtUserPostMessage(hwnd, WM_CLOSE, 0, 0);
 +}
 +
@@ -331,11 +258,10 @@
 +    return -1;
 +}
 +
-+/**********************************************************************
+ /**********************************************************************
   *          wayland_surface_clear_role
   *
-  * Clears the role related Wayland objects of a Wayland surface, making it a
-@@ -428,6 +581,20 @@
+@@ -436,6 +569,20 @@
  
          surface->toplevel_hwnd = 0;
          break;
@@ -356,64 +282,99 @@
      }
  
      memset(&surface->pending, 0, sizeof(surface->pending));
-@@ -805,6 +972,15 @@
+@@ -794,6 +941,12 @@
          if (!surface->wl_subsurface) break; /* surface role has been cleared */
          wayland_surface_reconfigure_subsurface(surface);
          break;
 +    case WAYLAND_SURFACE_ROLE_POPUP:
 +        if (!surface->popup_xdg_surface) break; /* surface role has been cleared */
-+        /* fusion-box: gate buffer commits until the compositor's initial
-+         * configure has been acked. Otherwise wine's GDI window_surface
-+         * flush would commit a buffer to the popup's wl_surface before
-+         * configure -> xdg-shell protocol error 3. surface->current.serial
-+         * is set by xdg_surface_handle_configure once we ack. */
++        /* fusion-box: gate commits until initial configure is acked
++         * (protocol error 3 otherwise). See patch 0004. */
 +        if (surface->current.serial == 0) return FALSE;
 +        break;
      }
  
      wayland_surface_reconfigure_size(surface, width, height);
---- a/dlls/winewayland.drv/waylanddrv.h
-+++ b/dlls/winewayland.drv/waylanddrv.h
-@@ -84,6 +84,12 @@
-     WAYLAND_SURFACE_ROLE_NONE,
-     WAYLAND_SURFACE_ROLE_TOPLEVEL,
-     WAYLAND_SURFACE_ROLE_SUBSURFACE,
-+    /* fusion-box: WS_POPUP windows with an owner toplevel get xdg_popup role
-+     * so the compositor can position them relative to the owner via
-+     * xdg_positioner. Without this, wine uses xdg_toplevel for popup menus,
-+     * giving the compositor no positioning hint - popups end up wherever
-+     * KWin chooses (often a different monitor entirely). */
-+    WAYLAND_SURFACE_ROLE_POPUP,
- };
+--- a/dlls/winewayland.drv/window.c	2026-07-03 18:28:05.793347579 -0400
++++ b/dlls/winewayland.drv/window.c	2026-07-03 18:29:43.509352620 -0400
+@@ -281,17 +281,62 @@
+ {
+     struct wayland_client_surface *client = data->client_surface;
+     struct wayland_surface *surface;
++    struct wayland_surface *popup_parent_surface = NULL;
++    HWND popup_owner_hwnd = 0;
++    RECT popup_anchor_rect = {0};
+     enum wayland_surface_role role;
+     BOOL visible;
++    DWORD style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
+     DWORD exstyle = NtUserGetWindowLongW(data->hwnd, GWL_EXSTYLE);
+     struct wl_region *input_region;
  
- struct wayland_keyboard
-@@ -287,6 +293,15 @@
-             struct wl_subsurface *wl_subsurface;
-             HWND toplevel_hwnd;
-         };
-+        /* fusion-box: WAYLAND_SURFACE_ROLE_POPUP branch. xdg_surface (same
-+         * type as in the toplevel branch above) plus xdg_popup + the HWND
-+         * of the owner toplevel so we can reposition on owner moves. */
-+        struct
+     TRACE("hwnd=%p\n", data->hwnd);
+ 
+-    visible = ((NtUserGetWindowLongW(data->hwnd, GWL_STYLE) & WS_VISIBLE) == WS_VISIBLE) &&
+-               (!(exstyle & WS_EX_LAYERED) || data->layered_attribs_set);
++    /* fusion-box: relax the WS_EX_LAYERED-without-attribs gate for WS_POPUP.
++     * Qt6 marks menus/tooltips WS_EX_LAYERED just for drop-shadow but renders
++     * via normal paths; original gate leaves them invisible forever. See
++     * patch 0004 header. */
++    visible = ((style & WS_VISIBLE) == WS_VISIBLE) &&
++               (!(exstyle & WS_EX_LAYERED) || data->layered_attribs_set ||
++                (style & WS_POPUP));
++
++    /* fusion-box: WS_POPUP + owner → xdg_popup so the compositor positions
++     * it relative to the owner (default xdg_toplevel routing lands popups
++     * on a random monitor). See patch 0004 header. */
++    if (visible && (style & WS_POPUP) && !(style & WS_CHILD) && !toplevel_surface)
++    {
++        popup_owner_hwnd = NtUserGetWindowRelative(data->hwnd, GW_OWNER);
++        /* fusion-box: Qt6 QMenu / tooltips create WS_POPUP with GW_OWNER=NULL.
++         * Fall back to foreground window, but ONLY for WS_EX_TOOLWINDOW
++         * (guard prevents parenting main-app WS_POPUP windows to the splash
++         * and crashing the compositor). See patch 0004 header. */
++        if ((!popup_owner_hwnd || popup_owner_hwnd == data->hwnd) &&
++            (exstyle & WS_EX_TOOLWINDOW))
++            popup_owner_hwnd = NtUserGetForegroundWindow();
++        if (popup_owner_hwnd && popup_owner_hwnd != data->hwnd)
 +        {
-+            struct xdg_surface *popup_xdg_surface;
-+            struct xdg_popup *xdg_popup;
-+            HWND popup_parent_hwnd;
-+        };
-     };
-     struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration;
-     enum zxdg_toplevel_decoration_v1_mode decoration_mode;
-@@ -337,6 +352,13 @@
-                                       int *window_x, int *window_y);
- struct wayland_client_surface *wayland_client_surface_create(HWND hwnd);
- void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel);
-+/* fusion-box: assign xdg_popup role to `surface`, anchored to
-+ * `parent_surface` (must already have an xdg_surface). `anchor_rect` is in
-+ * parent's surface-local coords; popup is positioned at the anchor's
-+ * top-left, extending down-right by `size`. Returns 0 on success. */
-+int wayland_surface_make_popup(struct wayland_surface *surface,
-+                               struct wayland_surface *parent_surface,
-+                               const RECT *anchor_rect, int width, int height);
- void wayland_surface_ensure_contents(struct wayland_surface *surface);
- void wayland_surface_set_title(struct wayland_surface *surface, LPCWSTR title);
- void wayland_surface_assign_icon(struct wayland_surface *surface);
++            struct wayland_win_data *owner_data =
++                wayland_win_data_get_nolock(popup_owner_hwnd);
++            if (owner_data && owner_data->wayland_surface &&
++                (owner_data->wayland_surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL ||
++                 owner_data->wayland_surface->role == WAYLAND_SURFACE_ROLE_POPUP))
++            {
++                popup_parent_surface = owner_data->wayland_surface;
++                /* Anchor rect: the popup's window rect translated to
++                 * owner-local coordinates. The popup itself sits with its
++                 * top-left at the anchor's top-left (see make_popup). */
++                popup_anchor_rect.left   = data->rects.window.left -
++                    owner_data->rects.window.left;
++                popup_anchor_rect.top    = data->rects.window.top -
++                    owner_data->rects.window.top;
++                popup_anchor_rect.right  = popup_anchor_rect.left + 1;
++                popup_anchor_rect.bottom = popup_anchor_rect.top + 1;
++            }
++        }
++    }
+ 
+     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
++    else if (popup_parent_surface) role = WAYLAND_SURFACE_ROLE_POPUP;
+     else if (toplevel_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+     else role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
+ 
+@@ -327,6 +372,15 @@
+     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
+         wayland_surface_make_subsurface(surface, toplevel_surface);
+         break;
++    case WAYLAND_SURFACE_ROLE_POPUP:
++    {
++        int pw = data->rects.window.right - data->rects.window.left;
++        int ph = data->rects.window.bottom - data->rects.window.top;
++        if (pw <= 0) pw = 1;
++        if (ph <= 0) ph = 1;
++        wayland_surface_make_popup(surface, popup_parent_surface, &popup_anchor_rect, pw, ph);
++        break;
++    }
+     }
+ 
+     if (visible && client) wayland_client_surface_attach(client, data->hwnd);

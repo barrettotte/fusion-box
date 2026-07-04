@@ -117,44 +117,52 @@
 #
 # Author: fusion-box (claude-code session, with Barrett Otte)
 #
---- a/dlls/winewayland.drv/waylanddrv.h
-+++ b/dlls/winewayland.drv/waylanddrv.h
-@@ -401,13 +401,46 @@
+
+--- a/dlls/winewayland.drv/waylanddrv.h	2026-07-03 18:32:23.843634691 -0400
++++ b/dlls/winewayland.drv/waylanddrv.h	2026-07-03 18:35:21.371370050 -0400
+@@ -84,11 +84,7 @@
+     WAYLAND_SURFACE_ROLE_NONE,
+     WAYLAND_SURFACE_ROLE_TOPLEVEL,
+     WAYLAND_SURFACE_ROLE_SUBSURFACE,
+-    /* fusion-box: WS_POPUP windows with an owner toplevel get xdg_popup role
+-     * so the compositor can position them relative to the owner via
+-     * xdg_positioner. Without this, wine uses xdg_toplevel for popup menus,
+-     * giving the compositor no positioning hint - popups end up wherever
+-     * KWin chooses (often a different monitor entirely). */
++    /* fusion-box: xdg_popup role for owned WS_POPUP menus. See patch 0004. */
+     WAYLAND_SURFACE_ROLE_POPUP,
+ };
+ 
+@@ -293,9 +289,7 @@
+             struct wl_subsurface *wl_subsurface;
+             HWND toplevel_hwnd;
+         };
+-        /* fusion-box: WAYLAND_SURFACE_ROLE_POPUP branch. xdg_surface (same
+-         * type as in the toplevel branch above) plus xdg_popup + the HWND
+-         * of the owner toplevel so we can reposition on owner moves. */
++        /* fusion-box: WAYLAND_SURFACE_ROLE_POPUP branch. See patch 0004. */
+         struct
+         {
+             struct xdg_surface *popup_xdg_surface;
+@@ -401,15 +395,28 @@
      BOOL is_fullscreen;
      BOOL managed;
      BOOL layered_attribs_set;
-+    /* fusion-box (patch 0006): when TRUE, wayland_surface is a "virtual" subsurface
-+     * that does not own its own wl_buffer. The toplevel's GDI buffer is attached to
-+     * this surface via a wp_viewport_set_source crop matching the child's rect, so
-+     * it surfaces above sibling DXVK client_subsurfaces that would otherwise bury
-+     * Qt6 WS_CHILD widgets painted into the toplevel's GDI. See
-+     * docs/bottom-toolbar-burial.md "2026-06-09 - Step 0 result: PASS". */
++    /* fusion-box (patch 0006): TRUE for "virtual" subsurfaces that don't own
++     * a wl_buffer — parent GDI buffer is cropped to the child's rect via
++     * wp_viewport_set_source, surfacing them above sibling DXVK
++     * client_subsurfaces. See patch 0006. */
 +    BOOL virtual_buffer;
-+    /* fusion-box (patch 0006): toplevel HWND this virtual_buffer subsurface is
-+     * attached to. Cached so set_window_surface_contents can find virtual
-+     * subsurface children of a given toplevel without walking the Win32 tree. */
++    /* fusion-box (patch 0006): toplevel this vsub is attached to (cache). */
 +    HWND virtual_toplevel;
-+    /* fusion-box (patch 0006 iter 4): track toplevel-size stability for
-+     * gating vsub behavior during resize. Qt's Win32 QPA plugin sends
-+     * transient WAYLAND_WindowPosChanged events for the toolbar HWND with
-+     * intermediate positions while re-laying out after a toplevel size
-+     * change (empirically up to 5+ consecutive frames with the same wrong
-+     * position, so per-child streak hysteresis is unreliable). Committing
-+     * the vsub crop with those transient coords pulls the wrong region of
-+     * the parent buffer (viewport white). We track the toplevel's own size:
-+     * while `toplevel_stable_count < 3` we treat the toplevel as "resizing"
-+     * and HIDE the vsub (attach NULL) rather than commit a wrong crop, so
-+     * the toolbar blinks out briefly and reappears at the correct spot when
-+     * layout settles. See virtual_committed_local below for the first-paint
-+     * exception. Only meaningful on wayland_win_data entries whose
-+     * wayland_surface has TOPLEVEL role. */
++    /* fusion-box (patch 0006 iter 4): toplevel-size stability tracking to
++     * gate vsub during Qt's transient in-between-layout positions. See
++     * patch 0006 header (only meaningful on TOPLEVEL entries). */
 +    RECT last_toplevel_screen_rect;
 +    int  toplevel_stable_count;
-+    /* fusion-box (patch 0006 iter 4): last-committed local rect for the
-+     * child's virtual subsurface. Written on each successful vsub commit;
-+     * remains zero-inited if the child has never been shown. Used by the
-+     * resize path to distinguish "never shown" (must paint even mid-resize
-+     * so launch works) from "already shown, may hide temporarily". */
++    /* fusion-box (patch 0006 iter 4): last-committed local rect. Zero =
++     * never shown. Lets the resize path distinguish first-paint (must
++     * paint) from already-shown (may temporarily hide). See patch 0006. */
 +    RECT virtual_committed_local;
  };
  
@@ -163,56 +171,25 @@
  void wayland_win_data_release(struct wayland_win_data *data);
 -/* fusion-box (patch 0003): walk the rb tree and tear down any client
 - * wl_subsurfaces whose toplevel matches `toplevel`. Called from
-+/* fusion-box (patch 0003 follow-up): walk the rb tree and tear down any
-+ * client wl_subsurfaces whose toplevel matches `toplevel`. Called from
-  * wayland_surface_destroy on a TOPLEVEL/POPUP wayland_surface to avoid
-  * leaving child subsurfaces orphaned when their parent wl_surface dies. */
+- * wayland_surface_destroy on a TOPLEVEL/POPUP wayland_surface to avoid
+- * leaving child subsurfaces orphaned when their parent wl_surface dies. */
++/* fusion-box: reap client subsurfaces whose toplevel is dying. See patch 0003. */
  void detach_client_subsurfaces_for_toplevel(HWND toplevel);
---- a/dlls/winewayland.drv/window.c
-+++ b/dlls/winewayland.drv/window.c
-@@ -640,15 +640,134 @@
+ 
+ struct wayland_client_surface *get_client_surface(HWND hwnd);
+--- a/dlls/winewayland.drv/window.c	2026-07-03 18:32:23.843658761 -0400
++++ b/dlls/winewayland.drv/window.c	2026-07-03 18:36:30.564373620 -0400
+@@ -620,15 +620,99 @@
                  wayland_client_surface_attach(client, NULL);
          }
  
 -        if (data->wayland_surface)
-+        /* fusion-box patch 0005: virtual subsurface eligibility.
-+         *
-+         * Qt6 WS_CHILD widgets that paint into their parent's GDI (instead of
-+         * owning their own DXVK swapchain) end up buried behind sibling
-+         * DXVK-bearing wl_subsurfaces of the toplevel - main's GDI buffer
-+         * (where Qt painted the child's pixels) is at the BOTTOM of the
-+         * subsurface tree by Wayland protocol, and no z-order shuffle among
-+         * main's siblings can lift it. See docs/bottom-toolbar-burial.md.
-+         *
-+         * The fix: synthesize a wl_subsurface for the child even though it
-+         * has no GDI window_surface of its own ("virtual_buffer"). At
-+         * set_window_surface_contents time we'll attach the toplevel's
-+         * shm_buffer to this child surface with a wp_viewport src crop
-+         * matching the child's screen-rect-within-toplevel. The virtual
-+         * subsurface lands above DXVK siblings by Wayland creation-order
-+         * rule.
-+         *
-+         * Gate (strict - earlier permissive version was a wreck: created
-+         * subsurfaces for the RHI viewport widget itself (which has its
-+         * own DXVK swapchain via data->client_surface), the ribbon panel
-+         * (huge area, intercepted clicks), etc. Triggered KWin protocol
-+         * errors and ~total UI brokenness. Verified on Fusion 2026-06-09.):
-+         *
-+         *   - HWND is a WS_CHILD (Qt6 child widget)
-+         *   - Visible (style & WS_VISIBLE) and non-empty rect
-+         *   - Has a toplevel ancestor whose wayland_surface is TOPLEVEL role
-+         *     (xdg_toplevel exists - required for the subsurface parent)
-+         *   - Has NO client_surface of its own (i.e., no DXVK swapchain;
-+         *     widgets with DXVK already present their own pixels via the
-+         *     existing client_surface_attach path - virtual promotion
-+         *     would create a competing surface)
-+         *   - Rect is "toolbar-like": height <= 50, width <= 1000. Fusion's
-+         *     nav toolbar is 239x24. This excludes full-content panels
-+         *     (viewport widget 2554x1195, ribbon area, side panels).
-+         *
-+         * If gate passes: create the wayland_surface as SUBSURFACE role
-+         * (or reuse if already there) and flag virtual_buffer=TRUE.
-+         * Otherwise fall through to the original destroy. */
++        /* fusion-box patch 0006: virtual-subsurface eligibility gate. Qt6
++         * WS_CHILD widgets painted into the toplevel's GDI get buried under
++         * sibling DXVK subsurfaces; we synthesize a wl_subsurface that
++         * crops the parent's shm_buffer to the child's rect. Strict gate
++         * — earlier permissive version created vsubs for ribbon/viewport
++         * and broke everything. See patch 0006 header. */
          {
 -            wayland_surface_destroy(data->wayland_surface);
 -            data->wayland_surface = NULL;
@@ -228,9 +205,6 @@
 +                w > 0 && h > 0 && h <= 50 && w <= 1000 &&
 +                !data->client_surface;
 +
-+            /* fusion-box-vsub instrumentation: log the decision and the
-+             * reason, so failed launches are easy to diagnose. Upgraded
-+             * to ERR so default WINEDEBUG=fixme-all,err-winediag sees it. */
 +            TRACE("[fusion-box-vsub] decide hwnd=%p toplevel=%p style=0x%lx vis=%d w=%d h=%d "
 +                "client_surf=%p toplevel_surf=%p tl_role=%d eligible=%d\n",
 +                hwnd, toplevel, (long)style, visible, w, h,
@@ -308,7 +282,7 @@
      }
  
      wayland_win_data_release(data);
-@@ -1015,7 +1134,7 @@
+@@ -995,7 +1079,7 @@
  BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region)
  {
      struct wayland_surface *wayland_surface;
@@ -317,25 +291,14 @@
      BOOL committed = FALSE;
  
      if (!(data = wayland_win_data_get(hwnd))) return FALSE;
-@@ -1034,6 +1153,183 @@
+@@ -1014,6 +1098,154 @@
          }
      }
  
-+    /* fusion-box patch 0005: after the toplevel commits its GDI buffer, walk
-+     * the rb tree for virtual_buffer children whose virtual_toplevel == hwnd.
-+     * For each, re-attach the toplevel's shm_buffer to the child's wl_surface
-+     * with wp_viewport_set_source cropped to the child's screen-rect-within-
-+     * toplevel, then commit the child. Mutex is held throughout (we're
-+     * inside wayland_win_data_get's lock); rb_tree iteration is safe.
-+     *
-+     * We use screen rects (NtUserGetWindowRect) and subtract the toplevel's
-+     * screen rect to get the toplevel-local rect - data->rects.window is
-+     * relative to the immediate parent's client area, which for deeply
-+     * nested WS_CHILDren isn't the toplevel.
-+     *
-+     * If only `committed` is TRUE we have a fresh shm_buffer attached; if
-+     * not, the toplevel itself wasn't ready, and re-attaching to children
-+     * would race. Skip in that case. */
++    /* fusion-box patch 0006: after toplevel commits its GDI buffer, walk
++     * virtual_buffer children of this toplevel and re-attach cropped to
++     * each child's toplevel-local rect. Screen rects are used because
++     * data->rects.window is parent-client relative. See patch 0006. */
 +    if (committed)
 +    {
 +        RECT toplevel_rect;
@@ -352,16 +315,9 @@
 +                         parent_surf->role == WAYLAND_SURFACE_ROLE_TOPLEVEL;
 +        if (NtUserGetWindowRect(hwnd, &toplevel_rect, 0))
 +        {
-+            /* fusion-box (patch 0006 iter 4): track toplevel-size stability
-+             * to gate vsub behavior during resize. Qt sends transient toolbar
-+             * rects while mid-relayout after a size change (empirically up to
-+             * 5+ consecutive frames with the same wrong position, so per-child
-+             * streak hysteresis is unreliable). Committing the vsub crop with
-+             * those transient coords pulls the wrong region of the parent
-+             * buffer (viewport white). During instability we HIDE the vsub
-+             * (attach NULL) instead of committing wrong pixels — see the hide
-+             * branch below. Threshold: 3 consecutive commits at the same
-+             * toplevel size before we consider it stable. */
++            /* fusion-box (patch 0006 iter 4): 3-frame stability threshold
++             * before treating toplevel as "not resizing" — Qt sends stale
++             * toolbar rects mid-relayout. See patch 0006 header. */
 +            BOOL toplevel_size_stable;
 +            if (EqualRect(&toplevel_rect, &data->last_toplevel_screen_rect))
 +                data->toplevel_stable_count++;
@@ -430,21 +386,10 @@
 +                child_local.right  = child_screen.right  - toplevel_rect.left;
 +                child_local.bottom = child_screen.bottom - toplevel_rect.top;
 +
-+                /* fusion-box (patch 0006 iter 4): during toplevel resize,
-+                 * HIDE the vsub (attach NULL to unmap) rather than commit
-+                 * with a stale or transient crop. When stable again, the
-+                 * vsub is re-mapped with a valid crop.
-+                 *
-+                 * Iter 3 (freeze crop + always commit) still flashed white
-+                 * because Qt re-lays out mid-resize: our stale crop coords
-+                 * end up over freshly-repainted viewport pixels in the new
-+                 * parent buffer, showing white where the toolbar used to be.
-+                 *
-+                 * Hiding is preferable to showing wrong pixels — the toolbar
-+                 * blinks out briefly during resize, then reappears at the
-+                 * correct position. First-ever commit (empty committed rect)
-+                 * skips the hide path and uses the current rect so launch
-+                 * paint is not lost. */
++                /* fusion-box (patch 0006 iter 4): hide vsub during resize
++                 * rather than commit with a stale crop (blink < white).
++                 * First-paint (empty committed rect) is excepted so launch
++                 * doesn't lose the initial paint. See patch 0006 header. */
 +                if (!toplevel_size_stable && !IsRectEmpty(&child->virtual_committed_local))
 +                {
 +                    TRACE("[fusion-box-vsub] hide hwnd=%p wl_subsurface_id=%u (toplevel resizing, stable_count=%d)\n",

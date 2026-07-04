@@ -119,45 +119,53 @@
 #
 # Author: fusion-box (claude-code session, with Barrett Otte)
 #
---- a/dlls/winewayland.drv/waylanddrv.h
-+++ b/dlls/winewayland.drv/waylanddrv.h
-@@ -432,6 +432,14 @@
-  * leaving child subsurfaces orphaned when their parent wl_surface dies. */
- void detach_client_subsurfaces_for_toplevel(HWND toplevel);
 
-+/* fusion-box patch 0008: after a client wl_subsurface is (re)anchored to a
-+ * toplevel (which places it at TOP of the parent's substack per Wayland
-+ * spec), walk the wayland_win_data rb tree and place_above each sibling
-+ * overlay subsurface to lift them back atop the freshly-anchored client.
-+ * Fixes static UI burial under DXVK swapchains at Fusion 360 sketch
-+ * entry/exit. */
+--- a/dlls/winewayland.drv/waylanddrv.h	2026-07-03 18:43:13.065394385 -0400
++++ b/dlls/winewayland.drv/waylanddrv.h	2026-07-03 19:50:09.594601594 -0400
+@@ -422,6 +422,10 @@
+ /* fusion-box: reap client subsurfaces whose toplevel is dying. See patch 0003. */
+ void detach_client_subsurfaces_for_toplevel(HWND toplevel);
+ 
++/* fusion-box: raise overlay siblings above a (re)anchored client subsurface.
++ * See patch 0008. */
 +void raise_overlay_siblings_above_client(struct wl_surface *client_wl_surface, HWND toplevel);
 +
  struct wayland_client_surface *get_client_surface(HWND hwnd);
  void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
  BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
---- a/dlls/winewayland.drv/window.c
-+++ b/dlls/winewayland.drv/window.c
-@@ -198,6 +198,49 @@
+--- a/dlls/winewayland.drv/wayland_surface.c	2026-07-03 18:36:54.180187209 -0400
++++ b/dlls/winewayland.drv/wayland_surface.c	2026-07-03 19:50:17.829602019 -0400
+@@ -1386,6 +1386,8 @@
+         /* Real toplevel change - must move the subsurface to a new parent.
+          * Destroy old one (different parent), create fresh. Don't recurse
+          * into attach(NULL) - that path now soft-hides only. */
++        TRACE("[fusion-box patch 0008] client (re)anchor hwnd=%p old_toplevel=%p new_toplevel=%p\n",
++              hwnd, client->toplevel, toplevel);
+         if (client->wl_subsurface)
+         {
+             wl_subsurface_destroy(client->wl_subsurface);
+@@ -1405,6 +1407,10 @@
+         wl_subsurface_set_desync(client->wl_subsurface);
+ 
+         client->toplevel = toplevel;
++
++        /* fusion-box: lift sibling overlays back above this fresh client
++         * subsurface (raised us to TOP by spec). See patch 0008. */
++        raise_overlay_siblings_above_client(client->wl_surface, toplevel);
+     }
+     /* If client->toplevel == toplevel AND wl_subsurface already exists,
+      * we just reconfigure position/size below - no destroy, no recreate,
+--- a/dlls/winewayland.drv/window.c	2026-07-03 18:43:34.443395488 -0400
++++ b/dlls/winewayland.drv/window.c	2026-07-03 19:49:57.361600963 -0400
+@@ -195,6 +195,38 @@
  }
-
+ 
  /***********************************************************************
 + *           raise_overlay_siblings_above_client  (patch 0008)
 + *
-+ * After a DXVK/Vulkan client wl_subsurface is (re)anchored to a toplevel via
-+ * wl_subcompositor_get_subsurface (in wayland_client_surface_attach), the
-+ * newly-created subsurface lands at the TOP of the parent's substack per
-+ * Wayland spec. For Fusion 360 this happens at sketch entry/exit when Qt6
-+ * reanchors the viewport's DXVK swapchain - the swapchain ends up above the
-+ * static overlay UI (navbar vsub from patch 0006, Object Browser, Comment
-+ * menu, etc.). Same family as patch 0002's fix for the reconfigure_* paths,
-+ * but the (re)attach path was missed.
-+ *
-+ * Walk the wayland_win_data rb tree finding sibling wl_subsurfaces of the
-+ * same toplevel (excluding the client_surface itself) and call
-+ * wl_subsurface_place_above(sibling, client_wl_surface) on each. The
-+ * static UI elements don't visually overlap, so we don't need to chain
-+ * place_above sibling-to-sibling - each just needs to be above the client.
++ * After a DXVK client wl_subsurface is (re)anchored, it lands at the TOP
++ * of the substack per Wayland spec, burying overlay UI. Walk siblings
++ * and raise each above the client. See patch 0008 header.
 + */
 +void raise_overlay_siblings_above_client(struct wl_surface *client_wl_surface, HWND toplevel)
 +{
@@ -188,7 +196,7 @@
   *              get_mwm_decoration_for_style
   */
  static BOOL get_mwm_decoration_for_style( DWORD style, DWORD ex_style )
-@@ -775,7 +818,7 @@
+@@ -702,7 +734,7 @@
                          TRACE("[fusion-box-vsub] CREATED hwnd=%p toplevel=%p wl_subsurface_id=%u rect=(%ld,%ld %dx%d) input=empty\n",
                              hwnd, toplevel,
                              wl_proxy_get_id((struct wl_proxy *)vs->wl_subsurface),
@@ -197,27 +205,3 @@
                              w, h);
                      }
                      else
---- a/dlls/winewayland.drv/wayland_surface.c
-+++ b/dlls/winewayland.drv/wayland_surface.c
-@@ -1446,6 +1446,8 @@
-         /* Real toplevel change - must move the subsurface to a new parent.
-          * Destroy old one (different parent), create fresh. Don't recurse
-          * into attach(NULL) - that path now soft-hides only. */
-+        TRACE("[fusion-box patch 0008] client (re)anchor hwnd=%p old_toplevel=%p new_toplevel=%p\n",
-+              hwnd, client->toplevel, toplevel);
-         if (client->wl_subsurface)
-         {
-             wl_subsurface_destroy(client->wl_subsurface);
-@@ -1465,6 +1467,12 @@
-         wl_subsurface_set_desync(client->wl_subsurface);
-
-         client->toplevel = toplevel;
-+
-+        /* fusion-box patch 0008: the new wl_subsurface lands at TOP of the
-+         * substack per Wayland spec, burying any pre-existing sibling
-+         * overlay subsurfaces (patch 0006 vsubs, Browser, Comments, etc).
-+         * Walk wayland_win_data tree and raise each one back above us. */
-+        raise_overlay_siblings_above_client(client->wl_surface, toplevel);
-     }
-     /* If client->toplevel == toplevel AND wl_subsurface already exists,
-      * we just reconfigure position/size below - no destroy, no recreate,

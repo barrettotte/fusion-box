@@ -1,14 +1,13 @@
 FROM docker.io/library/archlinux:latest
 
-# keyring + full sync. No multilib: Arch moved wine to pure WoW64 in 2025,
-# so wine-staging lives in extra and doesn't need lib32-* deps anymore.
+# Arch moved wine to pure WoW64 in 2025 — no multilib needed.
 RUN pacman-key --init && \
     pacman-key --populate archlinux && \
     pacman -Sy --noconfirm archlinux-keyring && \
     pacman -Syu --noconfirm
 
-# distrobox-init runtime deps
-# TODO: xorg-xauth, xorg-xkbcomp - remove after XWayland removed
+# distrobox-init runtime deps.
+# TODO: drop xorg-xauth, xorg-xkbcomp when XWayland is fully out of the picture.
 RUN pacman -Sy --noconfirm --needed \
         base-devel \
         git \
@@ -27,21 +26,12 @@ RUN pacman -Sy --noconfirm --needed \
         xorg-xkbcomp \
         ncurses
 
-# Debugging / reverse-engineering toolchain. radare2 is for inspecting Autodesk's bundled
-# PE binaries (AdskIdentityManager.exe, IdIPCServer.dll, Nu*10.dll) when we have to dig into Fusion internals.
-# mingw-w64 is for cross-compiling any DLL stubs we need to drop into the wineprefix.
-# Both are heavyweight but invaluable when the bug is several layers deep.
-# cmake + ninja: cross-build Qt 6.8.3 (qtbase) for Windows via mingw-w64. The Qt
-# patches under patches/qt/ target qwindows.dll's WM_SIZE handler etc. and need
-# a real Qt source rebuild, not a binary mod. python pulled in for Qt's syncqt
-# and other build helpers. qt6-base on Arch supplies host moc/rcc/syncqt that
-# Qt's cross-build invokes via QT_HOST_PATH=/usr; without it the build can't
-# generate moc files for the cross target.
-# ghidra + jdk21: r2 hits its limits on the 148MB Qt6WebEngineCore.dll. Ghidra's
-# decompiler + persistent project model is the right tool for finding patch sites
-# inside Chromium-122 code (the Data Panel render investigation). Heavy install
-# (~1GB) but the project file is reusable across sessions, unlike r2's per-session
-# re-analysis. See docs/qt6webengine-binary-patch.md.
+# Toolchain for RE + wine/Qt cross-builds.
+#   radare2 / ghidra + jdk21: inspect Autodesk PE binaries + Chromium code in
+#     Qt6WebEngineCore.dll (r2 for quick probes, ghidra for the big ones).
+#   mingw-w64: cross-compile helper DLLs + Qt 6.8.3 for Windows.
+#   cmake / ninja / python / qt6-base: Qt cross-build (host moc/rcc via QT_HOST_PATH).
+#   ccache: wraps wine builds; ~5min → ~30s warm rebuilds.
 RUN pacman -Sy --noconfirm --needed \
         mingw-w64-gcc \
         mingw-w64-headers \
@@ -57,24 +47,20 @@ RUN pacman -Sy --noconfirm --needed \
         python-pefile \
         qt6-base
 
-# wine + winetricks. DXVK and vkd3d-proton are installed per-prefix by
-# `winetricks dxvk` / `winetricks vkd3d` at prefix-init time (Phase 3 script);
-# the system-wide AUR packages aren't worth the AUR-helper dependency since
-# the DLLs only matter inside the prefix anyway.
+# wine-staging (baseline; scripts/build-wine.sh replaces with patched 11.10).
+# DXVK/vkd3d-proton get installed per-prefix by install-fusion.sh (winetricks).
 RUN pacman -Sy --noconfirm --needed \
         wine-staging \
         wine-mono \
         wine-gecko \
         winetricks
 
-# Vulkan loader (host NVIDIA driver + ICD injected at runtime by distrobox --nvidia,
-# so we only need the loader headers/binaries, not mesa layers).
-# Fusion is x64, so lib32 vulkan is deferred until DXVK 32-bit DLLs prove necessary.
+# Vulkan loader only — host NVIDIA ICD injected by distrobox --nvidia.
 RUN pacman -Sy --noconfirm --needed \
         vulkan-tools \
         vulkan-icd-loader
 
-# Audio + GL client libs. WoW64 wine handles 32-bit Windows apps via a 64-bit Linux process, so no lib32-* needed.
+# Audio + GL client libs. WoW64, so no lib32-*.
 # TODO: alsa-plugins needed?
 RUN pacman -Sy --noconfirm --needed \
         alsa-lib \
@@ -82,13 +68,13 @@ RUN pacman -Sy --noconfirm --needed \
         libpulse \
         libgl
 
-# Fusion installer requirements
+# Fusion installer requirements.
 RUN pacman -Sy --noconfirm --needed \
         cabextract \
         p7zip \
         unzip
 
-# Fonts (corefonts via winetricks at prefix-init time, not image)
+# Fonts (corefonts installed per-prefix via winetricks).
 RUN pacman -Sy --noconfirm --needed \
         ttf-liberation \
         ttf-dejavu \
@@ -96,13 +82,11 @@ RUN pacman -Sy --noconfirm --needed \
         noto-fonts-cjk \
         noto-fonts-emoji
 
-# xdg-open shim that forwards to the host. The stock xdg-open in this image detects
-# KDE (XDG_CURRENT_DESKTOP is inherited from the host) and tries to call kde-open, which isn't installed here.
-# Without this shim, wine's ShellExecute("https://...") -> xdg-open chain fails silently,
-# leaving Fusion's sign-in browser-launch unable to open the host browser.
+# xdg-open shim — the stock one detects KDE via inherited XDG_CURRENT_DESKTOP
+# and tries kde-open (not installed here); forward to host instead so wine's
+# ShellExecute("https://...") reaches the host browser.
 RUN printf '#!/bin/bash\nexec distrobox-host-exec xdg-open "$@"\n' > /usr/local/bin/xdg-open && chmod +x /usr/local/bin/xdg-open
 
-# pacman cache cleanup
 RUN pacman -Scc --noconfirm
 
 LABEL org.opencontainers.image.title=fusion-box

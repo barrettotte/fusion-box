@@ -65,8 +65,9 @@
 # Apply from the wine source root: `patch -p1 < this-file`. Depends on
 # patch 0002 (line offsets assume 0002's hunks are already applied).
 #
---- a/dlls/winewayland.drv/waylanddrv.h
-+++ b/dlls/winewayland.drv/waylanddrv.h
+
+--- a/dlls/winewayland.drv/waylanddrv.h	2026-07-03 18:21:17.701635342 -0400
++++ b/dlls/winewayland.drv/waylanddrv.h	2026-07-03 18:26:51.373731854 -0400
 @@ -384,6 +384,11 @@
  struct wayland_win_data *wayland_win_data_get(HWND hwnd);
  struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd);
@@ -79,19 +80,83 @@
  
  struct wayland_client_surface *get_client_surface(HWND hwnd);
  void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
---- a/dlls/winewayland.drv/window.c
-+++ b/dlls/winewayland.drv/window.c
-@@ -48,7 +48,22 @@
+--- a/dlls/winewayland.drv/wayland_surface.c	2026-07-03 18:22:40.613330804 -0400
++++ b/dlls/winewayland.drv/wayland_surface.c	2026-07-03 18:27:30.113345739 -0400
+@@ -214,6 +214,14 @@
+  */
+ void wayland_surface_destroy(struct wayland_surface *surface)
+ {
++    /* fusion-box: tear down client subsurfaces whose toplevel is this
++     * surface before we die — patch 0003 keeps them across transient
++     * detach, so we must explicitly reap on parent-destroy or KWin trips
++     * a "no parent" error. Walker lives in window.c (win_data_rb is
++     * static there). See patch 0003 header. */
++    if (surface->hwnd)
++        detach_client_subsurfaces_for_toplevel(surface->hwnd);
++
+     pthread_mutex_lock(&process_wayland.pointer.mutex);
+     if (process_wayland.pointer.focused_hwnd == surface->hwnd)
+     {
+@@ -1207,17 +1215,12 @@
+     HWND hwnd = client->client.hwnd;
+     RECT client_rect;
+ 
+-    if (!toplevel)
+-    {
+-        if (client->wl_subsurface)
+-        {
+-            wl_subsurface_destroy(client->wl_subsurface);
+-            client->wl_subsurface = NULL;
+-        }
+-
+-        client->toplevel = 0;
+-        return;
+-    }
++    /* fusion-box: keep the wl_subsurface across transient detach — destroy
++     * + recreate would put it at the TOP of the parent's substack (last-
++     * caller-wins z-order thrash), and attach(NULL) would blank GPU
++     * content already attached. Real teardown only on destroy or
++     * different-parent reattach below. See patch 0003 header. */
++    if (!toplevel) return;
+ 
+     if (!(toplevel_data = wayland_win_data_get_nolock(toplevel)) || !(surface = toplevel_data->wayland_surface))
+     {
+@@ -1227,7 +1230,14 @@
+ 
+     if (client->toplevel != toplevel)
+     {
+-        wayland_client_surface_attach(client, NULL);
++        /* Real toplevel change - must move the subsurface to a new parent.
++         * Destroy old one (different parent), create fresh. Don't recurse
++         * into attach(NULL) - that path now soft-hides only. */
++        if (client->wl_subsurface)
++        {
++            wl_subsurface_destroy(client->wl_subsurface);
++            client->wl_subsurface = NULL;
++        }
+ 
+         client->wl_subsurface =
+             wl_subcompositor_get_subsurface(process_wayland.wl_subcompositor,
+@@ -1243,6 +1253,9 @@
+ 
+         client->toplevel = toplevel;
+     }
++    /* If client->toplevel == toplevel AND wl_subsurface already exists,
++     * we just reconfigure position/size below - no destroy, no recreate,
++     * no stack-order shuffle. */
+ 
+     NtUserGetClientRect(hwnd, &client_rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
+     NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&client_rect, 2, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
+--- a/dlls/winewayland.drv/window.c	2026-07-03 18:21:17.701714332 -0400
++++ b/dlls/winewayland.drv/window.c	2026-07-03 18:28:05.793347579 -0400
+@@ -48,7 +48,19 @@
      return 0;
  }
  
 -static pthread_mutex_t win_data_mutex = PTHREAD_MUTEX_INITIALIZER;
-+/* fusion-box (patch 0003): recursive so that
-+ * detach_client_subsurfaces_for_toplevel can be called from
-+ * wayland_surface_destroy regardless of whether the caller already holds
-+ * win_data_mutex (most callers do; wayland_win_data_destroy doesn't).
-+ * Initialized lazily via pthread_once below since
-+ * PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP isn't portable enough for our taste. */
++/* fusion-box: recursive so detach_client_subsurfaces_for_toplevel can be
++ * called from wayland_surface_destroy without caring whether the caller
++ * holds win_data_mutex. Initialized lazily below. See patch 0003. */
 +static pthread_mutex_t win_data_mutex;
 +static pthread_once_t  win_data_mutex_once = PTHREAD_ONCE_INIT;
 +static void win_data_mutex_init(void)
@@ -105,7 +170,7 @@
  static struct rb_tree win_data_rb = { wayland_win_data_cmp_rb };
  
  /***********************************************************************
-@@ -72,6 +87,7 @@
+@@ -72,6 +84,7 @@
      data->hwnd = hwnd;
      data->rects = *rects;
  
@@ -113,7 +178,7 @@
      pthread_mutex_lock(&win_data_mutex);
  
      /* Check that another thread hasn't already created the wayland_win_data. */
-@@ -129,6 +145,7 @@
+@@ -129,6 +142,7 @@
  {
      struct wayland_win_data *data;
  
@@ -121,7 +186,7 @@
      pthread_mutex_lock(&win_data_mutex);
      if ((data = wayland_win_data_get_nolock(hwnd))) return data;
      pthread_mutex_unlock(&win_data_mutex);
-@@ -147,6 +164,39 @@
+@@ -147,6 +161,39 @@
      pthread_mutex_unlock(&win_data_mutex);
  }
  
@@ -161,88 +226,3 @@
  /***********************************************************************
   *              get_mwm_decoration_for_style
   */
---- a/dlls/winewayland.drv/wayland_surface.c
-+++ b/dlls/winewayland.drv/wayland_surface.c
-@@ -214,6 +214,21 @@
-  */
- void wayland_surface_destroy(struct wayland_surface *surface)
- {
-+    /* fusion-box (patch 0003): patch 0003 keeps client wl_subsurfaces alive
-+     * across transient detach calls. That's the right thing UNTIL the
-+     * parent wl_surface itself dies - then the kept-alive subsurfaces are
-+     * orphaned and the next operation on them hits KWin's "no parent" error,
-+     * terminating the wayland connection. (Reproduced 2026-06-09 on Fusion's
-+     * comment menu dismiss: popup's own client_surface was kept across an
-+     * attach(NULL), then wayland_surface_destroy fired on the popup itself
-+     * and orphaned the popup's client subsurface.)
-+     *
-+     * Fix: at parent-destroy time, walk all client_surfaces whose
-+     * toplevel == surface->hwnd and tear down their wl_subsurface explicitly.
-+     * The walker lives in window.c since win_data_rb is static there. */
-+    if (surface->hwnd)
-+        detach_client_subsurfaces_for_toplevel(surface->hwnd);
-+
-     pthread_mutex_lock(&process_wayland.pointer.mutex);
-     if (process_wayland.pointer.focused_hwnd == surface->hwnd)
-     {
-@@ -1226,17 +1241,23 @@
-     HWND hwnd = client->client.hwnd;
-     RECT client_rect;
- 
--    if (!toplevel)
--    {
--        if (client->wl_subsurface)
--        {
--            wl_subsurface_destroy(client->wl_subsurface);
--            client->wl_subsurface = NULL;
--        }
--
--        client->toplevel = 0;
--        return;
--    }
-+    /* fusion-box: do NOT destroy the wl_subsurface on transient "detach"
-+     * calls. Destroy + later recreate puts the new subsurface at the TOP
-+     * of the parent's substack per Wayland spec - for multiple sibling
-+     * child windows whose attach/detach pattern is driven by focus/configure
-+     * events (Autodesk Fusion 360, Qt QStackedWidget-style apps), this
-+     * causes "last to recreate wins" - the visible-topmost subsurface
-+     * shuffles randomly on every focus change. And detaching the buffer
-+     * (wl_surface_attach NULL) would unconditionally hide GPU-rendered
-+     * content that Vulkan/OpenGL already attached, leaving blank.
-+     *
-+     * Keep the subsurface, its buffer, and our toplevel tracking. Real
-+     * teardown happens only in wayland_client_surface_destroy or when the
-+     * parent wl_surface is being destroyed (handled by
-+     * detach_client_subsurfaces_for_toplevel called from wayland_surface_destroy).
-+     * The caller either re-attaches to the same toplevel (no-op below) or
-+     * to a different one (real destroy+recreate path). */
-+    if (!toplevel) return;
- 
-     if (!(toplevel_data = wayland_win_data_get_nolock(toplevel)) || !(surface = toplevel_data->wayland_surface))
-     {
-@@ -1246,7 +1267,14 @@
- 
-     if (client->toplevel != toplevel)
-     {
--        wayland_client_surface_attach(client, NULL);
-+        /* Real toplevel change - must move the subsurface to a new parent.
-+         * Destroy old one (different parent), create fresh. Don't recurse
-+         * into attach(NULL) - that path now soft-hides only. */
-+        if (client->wl_subsurface)
-+        {
-+            wl_subsurface_destroy(client->wl_subsurface);
-+            client->wl_subsurface = NULL;
-+        }
- 
-         client->wl_subsurface =
-             wl_subcompositor_get_subsurface(process_wayland.wl_subcompositor,
-@@ -1262,6 +1290,9 @@
- 
-         client->toplevel = toplevel;
-     }
-+    /* If client->toplevel == toplevel AND wl_subsurface already exists,
-+     * we just reconfigure position/size below - no destroy, no recreate,
-+     * no stack-order shuffle. */
- 
-     NtUserGetClientRect(hwnd, &client_rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
-     NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&client_rect, 2, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));

@@ -8,12 +8,9 @@ PREFIX="${WINEPREFIX_FUSION:-$HOME/.wine-fusion}"
 CACHE="$HOME/.cache/fusion-box"
 LOG="$CACHE/install.log"
 
-# Microsoft Edge WebView2 evergreen bootstrapper (~2 MB; pulls the runtime).
+# WebView2 evergreen bootstrapper (~2MB, pulls runtime on first run).
 WEBVIEW2_URL="https://go.microsoft.com/fwlink/p/?LinkId=2124703"
-
-# Autodesk Fusion 360 client downloader (bootstrapper, ~13 MB; pulls the full app on first run).
-# The historical "Fusion 360 Admin Install.exe" URL is now Akamai-403'd;
-# the Client Downloader is the surviving public download path.
+# Fusion 360 Client Downloader (~13MB). The old "Admin Install.exe" URL is 403.
 FUSION_URL="https://dl.appstreaming.autodesk.com/production/installers/Fusion%20Client%20Downloader.exe"
 
 mkdir -p "$CACHE"
@@ -64,8 +61,7 @@ phase_winver() {
         log "prefix Windows version already set"
         return
     fi
-    # Wine defaults to win7 (6.1.7601); Fusion's streamer hard-rejects anything below Win10 build 1809 (10.0.17763)
-    # and exits before downloading. Going straight to win11 since Autodesk has been warning that win10 is deprecated.
+    # Fusion streamer rejects <Win10 build 1809.
     log "setting prefix Windows version to win11..."
     winetricks --unattended win11
     touch "$marker"
@@ -97,8 +93,7 @@ phase_fusion() {
         log "downloading Fusion 360 admin streamer..."
         curl -fL --retry 3 "$FUSION_URL" -o "$installer"
     fi
-    # The Client Downloader needs BOTH --globalinstall AND --quiet for unattended; --quiet alone is a no-op.
-    # Documented in Autodesk's deployment guide.
+    # --quiet alone is a no-op; needs --globalinstall too (per Autodesk deployment guide).
     log "running Fusion streamer (downloads ~1 GB; expect 10-30 min over a slow link)..."
     wine "$installer" --globalinstall --quiet
 }

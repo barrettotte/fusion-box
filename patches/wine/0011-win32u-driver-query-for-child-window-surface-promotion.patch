@@ -52,28 +52,15 @@
 #
 # Author: fusion-box (claude-code session, with Barrett Otte)
 #
---- a/include/wine/gdi_driver.h	2026-05-29 16:04:32.000000000 -0400
-+++ b/include/wine/gdi_driver.h	2026-07-02 21:15:58.055910070 -0400
-@@ -421,6 +421,7 @@
-     BOOL    (*pGetWindowStyleMasks)(HWND,UINT,UINT,UINT*,UINT*);
-     BOOL    (*pGetWindowStateUpdates)(HWND,UINT*,UINT*,RECT*,HWND*);
-     BOOL    (*pCreateWindowSurface)(HWND,BOOL,const RECT *,struct window_surface**);
-+    BOOL    (*pShouldPromoteChildSurface)(HWND);
-     void    (*pMoveWindowBits)(HWND,const struct window_rects *,const struct window_rects *,const RECT *);
-     void    (*pWindowPosChanged)(HWND,HWND,HWND,UINT,const struct window_rects*,struct window_surface*);
-     /* system parameters */
---- a/dlls/win32u/driver.c	2026-05-29 16:04:32.000000000 -0400
-+++ b/dlls/win32u/driver.c	2026-07-02 21:16:58.811907647 -0400
-@@ -884,6 +884,17 @@
+
+--- a/dlls/win32u/driver.c	2026-07-03 20:33:59.816932509 -0400
++++ b/dlls/win32u/driver.c	2026-07-03 20:34:49.543739851 -0400
+@@ -884,6 +884,13 @@
      return FALSE;
  }
  
-+/* fusion-box (patch 0011): drivers may promote a WS_CHILD widget to have its
-+ * own driver-provided window_surface. Default: do not promote. Used by
-+ * winewayland.drv's patch 0006 to give Qt6 WS_CHILD widgets that get a
-+ * virtual subsurface their own wayland-backed shm_buffer for direct paint
-+ * routing. Preserves default WS_CHILD painting behavior for every other
-+ * driver and every other widget. */
++/* fusion-box: driver hook — should this WS_CHILD get its own window_surface?
++ * Default FALSE preserves stock behavior. See patch 0011. */
 +static BOOL nulldrv_ShouldPromoteChildSurface( HWND hwnd )
 +{
 +    return FALSE;
@@ -82,7 +69,7 @@
  static void nulldrv_MoveWindowBits( HWND hwnd, const struct window_rects *old_rects,
                                      const struct window_rects *new_rects, const RECT *valid_rects )
  {
-@@ -1303,6 +1314,7 @@
+@@ -1303,6 +1310,7 @@
      nulldrv_GetWindowStyleMasks,
      nulldrv_GetWindowStateUpdates,
      nulldrv_CreateWindowSurface,
@@ -90,7 +77,7 @@
      nulldrv_MoveWindowBits,
      nulldrv_WindowPosChanged,
      /* system parameters */
-@@ -1402,6 +1414,7 @@
+@@ -1402,6 +1410,7 @@
      SET_USER_FUNC(GetWindowStyleMasks);
      SET_USER_FUNC(GetWindowStateUpdates);
      SET_USER_FUNC(CreateWindowSurface);
@@ -98,21 +85,26 @@
      SET_USER_FUNC(MoveWindowBits);
      SET_USER_FUNC(WindowPosChanged);
      SET_USER_FUNC(SystemParametersInfo);
---- a/dlls/win32u/window.c	2026-05-29 16:04:32.000000000 -0400
-+++ b/dlls/win32u/window.c	2026-07-02 21:17:11.115907157 -0400
-@@ -2138,7 +2138,14 @@
+--- a/dlls/win32u/window.c	2026-07-03 20:33:59.818674710 -0400
++++ b/dlls/win32u/window.c	2026-07-03 20:34:58.244740300 -0400
+@@ -2138,7 +2138,9 @@
      else monitor_rects = map_window_rects_virt_to_raw( *rects, get_thread_dpi() );
  
      if (!user_driver->pWindowPosChanging( hwnd, swp_flags, shaped, &monitor_rects )) needs_surface = FALSE;
 -    else if (is_child) needs_surface = FALSE;
-+    /* fusion-box (patch 0011): children normally never get a driver-provided
-+     * window_surface (they share their parent's DIB). But winewayland.drv's
-+     * patch 0006 needs a wayland-backed shm_buffer for specific Qt6 WS_CHILD
-+     * widgets that have been "promoted" to a virtual subsurface — that
-+     * buffer is what its patch 0006 refactor attaches to the wl_subsurface.
-+     * The driver query defaults to FALSE (nulldrv), preserving legacy
-+     * behavior for every non-promoted child in every other driver. */
++    /* fusion-box: driver may promote specific WS_CHILDs to own a
++     * window_surface; nulldrv returns FALSE. See patch 0011. */
 +    else if (is_child && !user_driver->pShouldPromoteChildSurface( hwnd )) needs_surface = FALSE;
      else if (swp_flags & SWP_HIDEWINDOW) needs_surface = FALSE;
      else if (swp_flags & SWP_SHOWWINDOW) needs_surface = TRUE;
      else needs_surface = !!(style & WS_VISIBLE);
+--- a/include/wine/gdi_driver.h	2026-07-03 20:33:59.882821272 -0400
++++ b/include/wine/gdi_driver.h	2026-07-03 20:34:36.639988199 -0400
+@@ -421,6 +421,7 @@
+     BOOL    (*pGetWindowStyleMasks)(HWND,UINT,UINT,UINT*,UINT*);
+     BOOL    (*pGetWindowStateUpdates)(HWND,UINT*,UINT*,RECT*,HWND*);
+     BOOL    (*pCreateWindowSurface)(HWND,BOOL,const RECT *,struct window_surface**);
++    BOOL    (*pShouldPromoteChildSurface)(HWND);
+     void    (*pMoveWindowBits)(HWND,const struct window_rects *,const struct window_rects *,const RECT *);
+     void    (*pWindowPosChanged)(HWND,HWND,HWND,UINT,const struct window_rects*,struct window_surface*);
+     /* system parameters */

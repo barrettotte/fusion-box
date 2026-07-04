@@ -88,34 +88,19 @@
 #
 # Author: fusion-box (claude-code session, with Barrett Otte)
 #
---- a/dlls/win32u/input.c
-+++ b/dlls/win32u/input.c
-@@ -1672,8 +1672,43 @@
+
+--- a/dlls/win32u/input.c	2026-07-03 20:02:23.249547133 -0400
++++ b/dlls/win32u/input.c	2026-07-03 20:34:16.269738134 -0400
+@@ -1672,8 +1672,27 @@
      tracking->last_mouse_message_pos = pos;
  }
  
 -static void check_mouse_leave( HWND hwnd, int hittest, struct mouse_tracking_info *tracking )
 +static void check_mouse_leave( HWND hwnd, int hittest, struct mouse_tracking_info *tracking, const POINT *pos )
  {
-+    /* fusion-box patch 0010: when window_from_point returned NULL (cursor is
-+     * over no known HWND) but the cursor is still geometrically inside the
-+     * tracked HWND's rectangle, treat it as a TRANSIENT HOLE in the Win32
-+     * widget tree rather than a real mouse-leave. This avoids spurious
-+     * WM_MOUSELEAVE delivery during heavy Qt widget create/destroy churn
-+     * (e.g., Fusion 360 startup, tooltip-show paths) where window_from_point
-+     * briefly returns NULL between widget transitions. Without this, every
-+     * such NULL fires WM_MOUSELEAVE on the tracked hwnd, Qt cancels its
-+     * pending tooltip (SW_HIDE before paint), and the user sees an
-+     * icon-highlight without ever seeing the tooltip text.
-+     *
-+     * Only kicks in when:
-+     *   - get_mouse_window returned NULL hwnd (cursor over no HWND at all)
-+     *   - we have a tracked hwnd to compare against
-+     *   - cursor position is geometrically within tracked hwnd's window rect
-+     * In that case, swallow the leave. The next WM_SYSTIMER tick will
-+     * re-evaluate; if the gap closed up and the cursor is over the real
-+     * tracked hwnd, no leave was needed. If the cursor genuinely moved out
-+     * of the tracked rect, that next tick fires the leave normally. */
++    /* fusion-box: swallow WM_MOUSELEAVE when hwnd=NULL but the cursor is
++     * still inside the tracked rect — Qt widget churn creates transient
++     * holes in the HWND tree. See patch 0010. */
 +    if (!hwnd && pos && tracking->info.hwndTrack)
 +    {
 +        RECT track_rect = {0};
@@ -135,7 +120,7 @@
      if (tracking->info.hwndTrack != hwnd)
      {
          if (tracking->info.dwFlags & TME_NONCLIENT)
-@@ -1743,7 +1778,7 @@
+@@ -1743,7 +1762,7 @@
             hover_width, hover_height );
  
      if (tracking->info.dwFlags & TME_LEAVE)
@@ -144,7 +129,7 @@
  
      if (tracking->info.hwndTrack != hwnd)
          tracking->info.dwFlags &= ~TME_HOVER;
-@@ -1869,7 +1904,7 @@
+@@ -1869,7 +1888,7 @@
           * WM_MOUSEMOVE and call TrackMouseEvent before TrackMouseEventProc is
           * called. In such a situation, post the WM_MOUSELEAVE now. */
          if ((tracking->info.dwFlags & TME_LEAVE) && tracking->info.hwndTrack != NULL)

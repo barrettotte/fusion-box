@@ -91,14 +91,15 @@
 #
 # Author: fusion-box (claude-code session, with Barrett Otte)
 #
---- a/dlls/win32u/sysparams.c
-+++ b/dlls/win32u/sysparams.c
+
+--- a/dlls/win32u/sysparams.c	2026-07-03 18:28:45.224262503 -0400
++++ b/dlls/win32u/sysparams.c	2026-07-03 18:33:48.991365285 -0400
 @@ -2189,6 +2189,13 @@
      }
  
      physical = modes_count == 1 ? *modes : *current;
-+    /* fusion-box: preserve position info from `current` even when there's
-+     * only one mode (the common wayland case). See task #1. */
++    /* fusion-box: preserve position info from `current` even with a
++     * single mode (the common wayland case). See patch 0005. */
 +    if (current->dmFields & DM_POSITION)
 +    {
 +        physical.dmPosition = current->dmPosition;
@@ -107,14 +108,13 @@
      if (ctx->is_primary) ctx->primary = *current;
  
      detached.dmPelsWidth = 0;
---- a/dlls/winewayland.drv/display.c
-+++ b/dlls/winewayland.drv/display.c
-@@ -41,15 +41,37 @@
+--- a/dlls/winewayland.drv/display.c	2026-07-03 18:28:45.242744270 -0400
++++ b/dlls/winewayland.drv/display.c	2026-07-03 18:33:18.803363727 -0400
+@@ -41,15 +41,30 @@
      struct wayland_output_state *output;
  };
  
-+/* fusion-box: pixel count of an output's current mode, used as a fallback
-+ * primary heuristic when no output is anchored at the (0,0) origin. */
++/* fusion-box: fallback "primary" heuristic when no output is at (0,0). */
 +static unsigned long output_info_pixels(const struct output_info *info)
 +{
 +    if (!info->output->current_mode) return 0;
@@ -131,14 +131,8 @@
 -
 -    if (a_is_primary && !b_is_primary) return -1;
 -    if (!a_is_primary && b_is_primary) return 1;
-+    /* fusion-box: original heuristic was just `x == 0 && y == 0`. That works
-+     * on simple layouts where the user's primary is anchored at the origin,
-+     * but breaks on multi-monitor setups where KWin's coord space doesn't
-+     * start at (0,0). Fall back to largest-pixel-count: on real desktops
-+     * the user's "primary" is almost always their highest-resolution
-+     * display. Compositor-agnostic; no KDE/GNOME-specific protocol binding
-+     * required. After this sort, output_info_array_arrange_physical_coords
-+     * shifts every output so the first (true primary) lands at (0,0). */
++    /* fusion-box: prefer output at (0,0); if none, fall back to largest
++     * pixel count (matches real-desktop "primary"). See patch 0005. */
 +    BOOL a_is_origin = (a->x == 0 && a->y == 0);
 +    BOOL b_is_origin = (b->x == 0 && b->y == 0);
 +    if (a_is_origin && !b_is_origin) return -1;
@@ -152,18 +146,13 @@
      if (a->x < b->x) return -1;
      if (a->x > b->x) return 1;
      if (a->y < b->y) return -1;
-@@ -183,6 +205,27 @@
+@@ -183,6 +198,22 @@
       * to right, but ensure the primary output is first. */
      qsort(output_info_array->data, num_outputs, sizeof(struct output_info),
            output_info_cmp_primary_x_y);
 +
-+    /* fusion-box: after sort, output_info_array[0] is the primary. Shift
-+     * every output's physical coords so the primary lands at (0,0) - the
-+     * Windows convention that win32u and most Win32 apps assume. KWin's
-+     * coordinate space doesn't anchor at (0,0) for arbitrary multi-monitor
-+     * layouts, so without this shift the primary can sit at e.g. (0,1080)
-+     * and the rest of wine (and DXVK) hits paths that break in obscure
-+     * ways. */
++    /* fusion-box: shift all outputs so primary lands at (0,0) — Win32
++     * convention that DXVK + wine assume. See patch 0005. */
 +    if (num_outputs > 0)
 +    {
 +        struct output_info *first = output_info_array->data;

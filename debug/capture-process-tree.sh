@@ -1,27 +1,6 @@
 #!/bin/bash
-# Capture Fusion launch with full process-creation visibility + parallel
-# OS-level process-tree snapshots. Used to settle whether Qt6WebEngineCore
-# actually honors --single-process, by comparing the spawned wine subprocess
-# tree (and their commandlines) with and without the flag.
-#
-# Outputs (under debug/captures/):
-#   ptree-<label>-<ts>.log    - wine trace with +process,+waylanddrv,+win
-#   ptree-<label>-<ts>.ps     - periodic ps snapshots of wine processes
-#
-# Usage:
-#   bash debug/capture-process-tree.sh baseline
-#   QTWEBENGINE_CHROMIUM_FLAGS="--single-process --no-sandbox" \
-#     QTWEBENGINE_DISABLE_SANDBOX=1 \
-#     bash debug/capture-process-tree.sh sp
-#
-# Then diff the two captures to see which subprocesses --single-process
-# actually suppressed.
-#
-# Reproducer:
-#   1. Wait for main UI
-#   2. Click 'Show Data Panel' (triggers QtWebEngineProcess spawn)
-#   3. Wait ~10s for the panel to settle
-#   4. Close cleanly via X
+# Capture Fusion launch with +process,+waylanddrv,+win trace + parallel ps.
+# Usage: $0 <label>. Reproducer: wait for UI → Show Data Panel → wait 10s → close.
 
 set -euo pipefail
 
@@ -46,9 +25,7 @@ echo "[capture-process-tree]   4. Close cleanly via X"
 echo "[capture-process-tree] Launching in 3s..."
 sleep 3
 
-# Background ps snapshotter. Captures wine processes every 2s with full
-# commandline (args after the executable name), parent PID, and start time
-# so we can reconstruct the spawn tree. Writes to $PSLOG until killed.
+# Background ps snapshotter for spawn-tree reconstruction.
 (
     echo "=== ps snapshots (every 2s) for ptree-$LABEL ==="
     while true; do
@@ -61,10 +38,6 @@ sleep 3
 PS_PID=$!
 trap "kill $PS_PID 2>/dev/null || true" EXIT
 
-# Wine trace with process creation, wayland, and window-system channels.
-# +process logs every CreateProcess call with executable + argv - this is
-# the direct evidence of which wine subprocesses got spawned and what
-# command line they got (e.g., --type=renderer, --single-process, ...).
 export WINEDEBUG=+process,+waylanddrv,+win
 
 {

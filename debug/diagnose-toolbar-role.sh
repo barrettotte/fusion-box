@@ -1,20 +1,7 @@
 #!/bin/bash
-# fusion-box: gather everything needed to answer Step 1 of docs/bottom-toolbar-burial.md - what wayland role does the toolbar take?
-#
-# Two artifacts:
-#   1. ./out/probe-windows.txt - output of debug/wine-tests/probe-windows.c. Lists
-#      the toolbar HWND, its style/exstyle/owner. Lets us read patch 0003's role-decision gates by hand.
-#   2. ./out/wayland-trace.log - WINEDEBUG=+wayland capture from a separate Fusion launch, filtered to surface creation and role transitions.
-#
-# Usage (run inside fusion-box):
-#
-#   bash scripts/diagnose-toolbar-role.sh probe       # probe only; requires Fusion already up
-#   bash scripts/diagnose-toolbar-role.sh trace       # launch Fusion with WINEDEBUG=+wayland
-#   bash scripts/diagnose-toolbar-role.sh both        # trace launch + probe inside same wineserver
-#
-# `both` is the most useful: it launches Fusion under tracing, waits long
-# enough for the toolbar to appear, runs the probe, then stops. Output lands
-# in $OUT_DIR.
+# Probe the toolbar's wayland role for docs/bottom-toolbar-burial.md.
+# Produces $OUT_DIR/{probe-windows.txt, wayland-trace.log}.
+# Usage: $0 [probe|trace|both]  (default: both).
 
 set -euo pipefail
 
@@ -46,8 +33,6 @@ run_probe() {
     build_probe
     local out="$OUT_DIR/probe-windows.txt"
     log "running probe-windows -> $out"
-    # The probe enumerates whatever is in the current wineserver; if Fusion is up in the same prefix,
-    # this dumps Fusion's window tree. If not, we get just the probe's own windows (~empty).
     "$WINE_BIN" "$PROBE_BIN" > "$out" 2>&1 || true
     log "probe lines for the toolbar class:"
     grep -A 6 "Qt683QWindowToolSaveBits" "$out" | head -40 || true
@@ -55,9 +40,7 @@ run_probe() {
 
 trace_launch() {
     local out="$OUT_DIR/wayland-trace.log"
-    log "launching Fusion with WINEDEBUG=+waylanddrv -> $out"
-    log "  (this is a fresh launch; existing Fusion sessions will be killed)"
-    # Use the existing launcher's kill / prewarm semantics; just override WINEDEBUG and stash stderr.
+    log "launching Fusion with WINEDEBUG=+waylanddrv -> $out (kills prior session)"
     WINEDEBUG="+waylanddrv,fixme-all,err-winediag" \
     FUSION_PREWARM_IDM=1 bash "$REPO_DIR/scripts/launch-fusion.sh" > "$out" 2>&1 &
     LAUNCH_PID=$!
