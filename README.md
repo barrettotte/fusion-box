@@ -160,11 +160,6 @@ I only verified a simple CAD workflow for designing and exporting objects for 3D
 - Simulation
 - Generative Design
 
-## TODO
-
-- progress bars for install/build or more logging for user feedback
-- use `COPY` for repo instead of symlinked reference
-
 ## Attribution
 
 If any patches or code were ripped from another source, the patch has clear attribution at the top of the file.
