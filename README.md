@@ -33,6 +33,40 @@ Also I'm honestly just curious how in the world to get this to work given my sel
 - **Minimal host changes.** One `.desktop` file for the OAuth callback. No host packages, no host wine, no host wineprefix.
 - **No prebuilt binaries shipped.** All wine patches as `.patch` files applied at build time. No prebuilt DLLs.
 
+## Prerequisites (host)
+
+The host runs:
+
+- **Wayland session** on KDE Plasma 6 or GNOME (tested on KWin; Mutter likely works and may hit fewer bugs).
+- **NVIDIA proprietary/open driver** if you want GPU acceleration under `--nvidia` (Mesa on AMD/Intel works too, drop `--nvidia`).
+- **These host packages** — needed before running any script in this repo:
+
+| package | used by |
+|---|---|
+| `distrobox` | container create/enter/rm |
+| `podman` | image build |
+| `xdg-utils` | `install-host-handler.sh` (registers `adskidmgr://`) |
+| `desktop-file-utils` | both `install-host-handler.sh` and `install-fusion-launcher.sh` (`update-desktop-database`) |
+| `imagemagick` **or** `icoutils` | `install-fusion-launcher.sh` (crisp multi-res icon extraction; falls back to a blurry `.ico` copy if neither is present) |
+
+Per-distro install:
+
+```bash
+# Bazzite / Fedora Silverblue / Kinoite (atomic — distrobox + podman come pre-installed):
+rpm-ostree install ImageMagick icoutils desktop-file-utils xdg-utils
+
+# Fedora Workstation:
+sudo dnf install distrobox podman ImageMagick icoutils desktop-file-utils xdg-utils
+
+# Arch:
+sudo pacman -S distrobox podman imagemagick icoutils desktop-file-utils xdg-utils
+
+# Ubuntu 24.04+ / Debian 13+:
+sudo apt install distrobox podman imagemagick icoutils desktop-file-utils xdg-utils
+```
+
+Everything else — wine build toolchain, DXVK, Vulkan runtime, fonts — lives inside the container and is installed by `build-container.sh`. Nothing on the host wine side.
+
 ## Quick start
 
 Run everything from the repo root. `distrobox enter` preserves the host CWD inside the container, so relative paths work for both host and container commands.
@@ -64,6 +98,21 @@ bash scripts/install-fusion-launcher.sh
 # Launch Fusion (kills any prior wineserver first) — or just click the launcher.
 distrobox enter fusion-box -- bash scripts/launch-fusion.sh
 ```
+
+### Uninstall
+
+```bash
+# Print what would be removed (safe, no changes):
+bash scripts/uninstall.sh --dry-run
+
+# Interactive removal:
+bash scripts/uninstall.sh
+
+# Non-interactive; also drop --keep-image / --keep-cache to preserve those:
+bash scripts/uninstall.sh --yes
+```
+
+Removes the launcher + icons, the adskidmgr:// handler, the distrobox container, the podman image, the patched wine install, the Fusion wineprefix (LARGE — several GB), and the build/download caches. If you built with `BOX_HOME=...`, pass the same env var so the wineprefix/wine-install/cache paths resolve inside it.
 
 Override defaults via env:
 
