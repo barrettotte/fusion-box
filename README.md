@@ -4,6 +4,8 @@ Experimental: patched wine 11.10 (winewayland.drv) + DXVK in a distrobox contain
 
 Refer to [cryinkfly's project for a more stable/tested Autodesk Fusion on Linux experience](https://codeberg.org/cryinkfly/Autodesk-Fusion-360-on-Linux)
 
+![assets/fusion.png](assets/fusion.png)
+
 Primarily tested on:
 - **OS:** Bazzite 44 Kinoite, NVIDIA Open image (`bazzite-nvidia-open-44.20260605`; Fedora 44 atomic base, kernel `7.0.9-ogc3.2.fc44` - Bazzite's CachyOS-derived optimized kernel)
 - **Desktop:** KDE Plasma 6.6.5 (Wayland session, KWin compositor)
