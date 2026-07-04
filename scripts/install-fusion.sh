@@ -19,6 +19,16 @@ exec > >(tee -a "$LOG") 2>&1
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 die() { log "FAIL: $*"; exit 1; }
 
+# run_phase N TOTAL "name" fn — banner + elapsed time around a phase function.
+# Idempotency-skips inside the fn still print via log; banner shows the phase either way.
+run_phase() {
+    local num="$1" total="$2" name="$3" fn="$4"
+    log "===== phase $num/$total: $name ====="
+    local start=$SECONDS
+    "$fn"
+    log "===== phase $num/$total done in $((SECONDS - start))s ====="
+}
+
 command -v wine       >/dev/null || die "wine not on PATH. Run this inside fusion-box: distrobox enter fusion-box"
 command -v winetricks >/dev/null || die "winetricks not on PATH"
 command -v curl       >/dev/null || die "curl not on PATH"
@@ -106,10 +116,11 @@ verify() {
 }
 
 log "===== install-fusion.sh start (prefix=$PREFIX) ====="
-phase_wineboot
-phase_winetricks
-phase_winver
-phase_webview2
-phase_fusion
+TOTAL_START=$SECONDS
+run_phase 1 5 "init wineprefix (~30s cold)"                            phase_wineboot
+run_phase 2 5 "winetricks verbs (~5-10 min; .NET + fonts + DXVK)"      phase_winetricks
+run_phase 3 5 "set Windows version to Win11"                           phase_winver
+run_phase 4 5 "install Microsoft Edge WebView2 runtime (~2-5 min)"     phase_webview2
+run_phase 5 5 "install Fusion 360 (~10-30 min; ~5 GB download)"        phase_fusion
 verify
-log "===== install-fusion.sh done ====="
+log "===== install-fusion.sh done in $((SECONDS - TOTAL_START))s ====="

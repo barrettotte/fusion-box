@@ -1,16 +1,31 @@
 #!/bin/bash
 # Build patched wine for fusion-box (mainline 11.10 + patches/wine/*).
 #
-# Env vars:
+# Usage:
+#   ./build-wine.sh              # full build: fetch, patch, configure, make, install
+#   ./build-wine.sh --fast       # incremental: make in cached tree + copy changed .so/.dll
+#
+# Env vars (full build):
 #   USE_STAGING=1        wine-staging patchset before ours (default 0).
 #   APPLY_FUSION_PATCHES=0  skip patches/wine/*.
 #   BUILD_WINE_FORCE=1   force rebuild even if stamp matches.
 #   USE_CCACHE=0         disable ccache wrapping.
 #   MAX_PATCH_NUM=N      apply only patches 0001..000N (bisect).
 #
-# Idempotent — sha256-stamps wine version + patch list, skips if unchanged.
+# Env vars (--fast):
+#   WINE_WORK_TREE=...   rsync winewayland.drv/ from this tree before rebuilding.
+#
+# Full build is idempotent — sha256-stamps wine version + patch list, skips if unchanged.
 
 set -euo pipefail
+
+FAST=0
+for arg in "$@"; do
+    case "$arg" in
+        --fast) FAST=1 ;;
+        *) echo "unknown arg: $arg" >&2; exit 2 ;;
+    esac
+done
 
 WINE_VERSION="11.10"
 WINE_SRC_URL="https://dl.winehq.org/wine/source/11.x/wine-${WINE_VERSION}.tar.xz"
@@ -33,6 +48,45 @@ BUILD_DIR="$SRC_DIR/build"
 STAMP_FILE="$INSTALL_PREFIX/.fusion-box-build-stamp"
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
+
+# --- --fast path: incremental rebuild of cached source tree ---
+if [ "$FAST" = 1 ]; then
+    [ -d "$SRC_DIR" ]   || { echo "no source tree at $SRC_DIR - run without --fast first" >&2; exit 1; }
+    [ -d "$BUILD_DIR" ] || { echo "no build dir at $BUILD_DIR - run without --fast first" >&2; exit 1; }
+
+    if [ -n "${WINE_WORK_TREE:-}" ]; then
+        log "syncing source edits from $WINE_WORK_TREE -> $SRC_DIR"
+        rsync -a --include='*.c' --include='*.h' --include='*.xml' --include='*/' --exclude='*' \
+            "$WINE_WORK_TREE/dlls/winewayland.drv/" "$SRC_DIR/dlls/winewayland.drv/"
+    fi
+
+    log "make -j$(nproc) in $BUILD_DIR"
+    ( cd "$BUILD_DIR" && make -j"$(nproc)" 2>&1 | tail -20 )
+
+    log "copying rebuilt binaries to $INSTALL_PREFIX"
+    # Copy every freshly-built .so (Unix wine modules) and .dll (PE builtins).
+    # Filter by -newer stamp so we only touch what actually changed this build.
+    find "$BUILD_DIR/dlls" "$BUILD_DIR/programs" \( -name '*.so' -o -name '*.dll' \) \
+        -newer "$STAMP_FILE" \
+        -print 2>/dev/null | while read f; do
+
+        rel="${f#$BUILD_DIR/}"
+        base="$(basename "$f")"
+        for target_dir in lib/wine/x86_64-unix lib/wine/x86_64-windows; do
+            target="$INSTALL_PREFIX/$target_dir/$base"
+            if [ -f "$target" ]; then
+                cp -p "$f" "$target"
+                echo "  $rel -> $target"
+            fi
+        done
+    done
+
+    log "fast rebuild done"
+    "$INSTALL_PREFIX/bin/wine" --version
+    exit 0
+fi
+
+# --- full build path ---
 
 # Emit patches whose numeric prefix is <= MAX_PATCH_NUM (bisect helper).
 filtered_patches() {

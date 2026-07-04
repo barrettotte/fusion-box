@@ -77,15 +77,11 @@
 #              as a normal KWin-decorated dialog matching native Windows.
 #   Not fixed: Export dialog (GW_OWNER=NULL under WebView2). Same
 #              behavior as pre-patch: independent toplevel with a plain
-#              SSD titlebar, no minimize propagation. See
-#              docs/observed-issues.md.
+#              SSD titlebar, no minimize propagation.
 #
 # Related:
 #   - patches/wine/0004-winewayland-xdg-popup-support.patch (this patch
 #     is a targeted carve-out of 0004's role decision).
-#   - docs/observed-issues.md line ~469 "Popups stay visible when parent
-#     toplevel is minimized" (dialog subclass fix - transient popups
-#     still exhibit the bug by design).
 
 --- a/dlls/winewayland.drv/window.c	2026-07-03 20:36:32.044745139 -0400
 +++ b/dlls/winewayland.drv/window.c	2026-07-03 20:38:40.235751752 -0400

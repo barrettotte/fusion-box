@@ -5,9 +5,7 @@
 # Bug A - cursor disappears after clicking into Qt6 docked panels:
 # Clicking inside Fusion 360's Object Browser (a docked Qt6 panel) hides
 # the cursor until you move out of the panel and back in. Same class of
-# bug suspected on other Qt panel interactions; documented in
-# docs/observed-issues.md as "Clicking on object browser makes mouse
-# disappear temporarily (move away and back in to fix). Suspect
+# bug suspected on other Qt panel interactions; Suspect
 # cursor-shape race in wayland_pointer.c."
 #
 # Bug B - Object Browser flickers visually on click:

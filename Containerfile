@@ -1,14 +1,15 @@
 FROM docker.io/library/archlinux:latest
 
 # Arch moved wine to pure WoW64 in 2025 — no multilib needed.
-RUN pacman-key --init && \
+RUN echo "==> phase 1/10: syncing package db + upgrading base image (~2 min)" && \
+    pacman-key --init && \
     pacman-key --populate archlinux && \
     pacman -Sy --noconfirm archlinux-keyring && \
     pacman -Syu --noconfirm
 
 # distrobox-init runtime deps.
-# TODO: drop xorg-xauth, xorg-xkbcomp when XWayland is fully out of the picture.
-RUN pacman -Sy --noconfirm --needed \
+RUN echo "==> phase 2/10: installing distrobox runtime deps" && \
+    pacman -Sy --noconfirm --needed \
         base-devel \
         git \
         sudo \
@@ -22,60 +23,54 @@ RUN pacman -Sy --noconfirm --needed \
         gnupg \
         pinentry \
         xdg-utils \
-        xorg-xauth \
-        xorg-xkbcomp \
         ncurses
 
-# Toolchain for RE + wine/Qt cross-builds.
-#   radare2 / ghidra + jdk21: inspect Autodesk PE binaries + Chromium code in
-#     Qt6WebEngineCore.dll (r2 for quick probes, ghidra for the big ones).
-#   mingw-w64: cross-compile helper DLLs + Qt 6.8.3 for Windows.
-#   cmake / ninja / python / qt6-base: Qt cross-build (host moc/rcc via QT_HOST_PATH).
+# Toolchain for building patched wine from source.
+#   mingw-w64: wine PE-side build (x86_64-w64-mingw32-gcc).
+#   python: wine-staging patchinstall.py (USE_STAGING=1 path).
 #   ccache: wraps wine builds; ~5min → ~30s warm rebuilds.
-RUN pacman -Sy --noconfirm --needed \
+RUN echo "==> phase 3/10: installing wine build toolchain (mingw + ccache + python)" && \
+    pacman -Sy --noconfirm --needed \
         mingw-w64-gcc \
         mingw-w64-headers \
         mingw-w64-winpthreads \
-        radare2 \
-        ghidra \
-        jdk21-openjdk \
         ccache \
-        cmake \
-        ninja \
-        python \
-        python-capstone \
-        python-pefile \
-        qt6-base
+        python
 
-# wine-staging (baseline; scripts/build-wine.sh replaces with patched 11.10).
-# DXVK/vkd3d-proton get installed per-prefix by install-fusion.sh (winetricks).
-RUN pacman -Sy --noconfirm --needed \
+# wine-staging: baseline binary (webview2-test A/B harness targets /usr/bin/wine-staging).
+# wine-mono + wine-gecko: MSI runtimes our patched wine picks up on prefix init.
+# winetricks: used by install-fusion.sh to drop DXVK into the wineprefix.
+RUN echo "==> phase 4/10: installing wine runtime (staging + mono + gecko + winetricks)" && \
+    pacman -Sy --noconfirm --needed \
         wine-staging \
         wine-mono \
         wine-gecko \
         winetricks
 
-# Vulkan loader only — host NVIDIA ICD injected by distrobox --nvidia.
-RUN pacman -Sy --noconfirm --needed \
-        vulkan-tools \
-        vulkan-icd-loader
+# Vulkan loader (Fusion+DXVK runtime) + vulkan-tools (vulkaninfo for user GPU troubleshooting).
+# Host NVIDIA ICD is injected by distrobox --nvidia.
+RUN echo "==> phase 5/10: installing Vulkan runtime" && \
+    pacman -Sy --noconfirm --needed \
+        vulkan-icd-loader \
+        vulkan-tools
 
 # Audio + GL client libs. WoW64, so no lib32-*.
-# TODO: alsa-plugins needed?
-RUN pacman -Sy --noconfirm --needed \
+RUN echo "==> phase 6/10: installing audio + GL runtime" && \
+    pacman -Sy --noconfirm --needed \
         alsa-lib \
-        alsa-plugins \
         libpulse \
         libgl
 
 # Fusion installer requirements.
-RUN pacman -Sy --noconfirm --needed \
+RUN echo "==> phase 7/10: installing Fusion installer deps" && \
+    pacman -Sy --noconfirm --needed \
         cabextract \
         p7zip \
         unzip
 
 # Fonts (corefonts installed per-prefix via winetricks).
-RUN pacman -Sy --noconfirm --needed \
+RUN echo "==> phase 8/10: installing fonts" && \
+    pacman -Sy --noconfirm --needed \
         ttf-liberation \
         ttf-dejavu \
         noto-fonts \
@@ -85,9 +80,11 @@ RUN pacman -Sy --noconfirm --needed \
 # xdg-open shim — the stock one detects KDE via inherited XDG_CURRENT_DESKTOP
 # and tries kde-open (not installed here); forward to host instead so wine's
 # ShellExecute("https://...") reaches the host browser.
-RUN printf '#!/bin/bash\nexec distrobox-host-exec xdg-open "$@"\n' > /usr/local/bin/xdg-open && chmod +x /usr/local/bin/xdg-open
+RUN echo "==> phase 9/10: installing xdg-open shim" && \
+    printf '#!/bin/bash\nexec distrobox-host-exec xdg-open "$@"\n' > /usr/local/bin/xdg-open && chmod +x /usr/local/bin/xdg-open
 
-RUN pacman -Scc --noconfirm
+RUN echo "==> phase 10/10: cleaning pacman cache" && \
+    pacman -Scc --noconfirm
 
 LABEL org.opencontainers.image.title=fusion-box
 LABEL org.opencontainers.image.description="Autodesk Fusion 360 under patched wine 11.10 (winewayland.drv) + DXVK"

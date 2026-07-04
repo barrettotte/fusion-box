@@ -40,12 +40,12 @@ Run everything from the repo root. `distrobox enter` preserves the host CWD insi
 ```bash
 # One-time: build the container image and create the distrobox.
 # Drop --nvidia if you don't have an NVIDIA card.
-bash build-container.sh --nvidia
+bash scripts/build-container.sh --nvidia
 
 # Optional: isolate the container's $HOME to a separate path so Fusion's wineprefix + wine builds don't live in your real $HOME. 
 # Skip this if you want Fusion's wineprefix at ~/.wine-fusion in your normal $HOME.
 # Note: with BOX_HOME set, ~ inside the container is no longer your host $HOME
-BOX_HOME=/var/mnt/code/distrobox/fusion-box bash build-container.sh --nvidia
+BOX_HOME=/var/mnt/code/distrobox/fusion-box bash scripts/build-container.sh --nvidia
 
 # Build the patched wine inside the container
 distrobox enter fusion-box -- bash scripts/build-wine.sh
@@ -56,7 +56,12 @@ distrobox enter fusion-box -- bash scripts/install-fusion.sh
 # One-time host-side: register adskidmgr:// URL handler so OAuth callback from host browser can reach in-container IDM process
 bash scripts/install-host-handler.sh
 
-# Launch Fusion (kills any prior wineserver first)
+# Optional host-side: install a desktop launcher (fusion-box.desktop + icon) so you can start Fusion from the app menu.
+# If you set BOX_HOME above, also pass WINEPREFIX_FUSION so it can find the icon:
+#   WINEPREFIX_FUSION=/var/mnt/code/distrobox/fusion-box/.wine-fusion bash scripts/install-fusion-launcher.sh
+bash scripts/install-fusion-launcher.sh
+
+# Launch Fusion (kills any prior wineserver first) — or just click the launcher.
 distrobox enter fusion-box -- bash scripts/launch-fusion.sh
 ```
 
@@ -69,17 +74,16 @@ Override defaults via env:
 | `FUSION_PREWARM_IDM=0` | skip the IDSDK prewarm step in the launcher |
 | `FUSION_QT_TEXT_ENGINE=freetype\|gdi\|directwrite` | which Qt text engine to use. Default `freetype` uses Qt's bundled FreeType — every letter renders, fi ligature is mildly cosmetic. `gdi` renders tooltips cleanly but drops capital I from every menu item ("Insert…" → "nsert…"). `directwrite` (Qt 6.8's Windows default) produces malformed P/T/fi under wine's `dwrite.dll` and is diagnostic-only. |
 | `FUSION_QTWE_SINGLE_PROCESS=1` | pass `--single-process` to `Qt6WebEngineCore` (Chromium). Diagnostic only — Qt WebEngine strips subprocess flags, so this is effectively a no-op today. |
-| `FUSION_WEBVIEW2_DISABLE_DCOMP=1` | pass `--disable-direct-composition` to Edge WebView2. Historically used to work around Fusion's Data Panel; the panel is now resolved by fresh-prefix reinstall (see `docs/observed-issues.md`). |
+| `FUSION_WEBVIEW2_DISABLE_DCOMP=1` | pass `--disable-direct-composition` to Edge WebView2. Historically used to work around Fusion's Data Panel; the panel is now resolved by fresh-prefix reinstall. |
 | `FUSION_WEBVIEW2_FORCE_SW=1` | force WebView2 pure-software renderer (`--disable-gpu --disable-gpu-compositing --use-gl=swiftshader`). Same context as `_DISABLE_DCOMP`. |
 | `WINEPREFIX_FUSION=...` | override the wineprefix path used by `install-fusion.sh` and `launch-fusion.sh` (default `~/.wine-fusion`). |
 | `WINE_INSTALL_PREFIX=...` | install patched wine elsewhere (default `~/wine-versions/wine-11.10-fusion`) |
-| `BOX_HOME=...` | (passed to `build-container.sh`) bind-mount this dir as the container's `$HOME` |
+| `BOX_HOME=...` | (passed to `scripts/build-container.sh`) bind-mount this dir as the container's `$HOME` |
 | `BUILD_WINE_FORCE=1` | (passed to `build-wine.sh`) force re-extract source tarball and re-apply all patches from scratch, even if the build stamp matches. Use after editing `patches/wine/*.patch` to verify the canonical chain still applies and produces a working binary. ~5 min cold build. |
-| `BUILD_QT_FORCE=1` | (passed to `build-qt.sh`) force re-fetch + rebuild of Qt 6.8.3 from scratch. Only relevant if you are working on `patches/qt/*.patch` — the standard Fusion path does not use the Qt build. |
 | `MAX_PATCH_NUM=N` | (passed to `build-wine.sh`) only apply patches 0001..N. Set `MAX_PATCH_NUM=0` for vanilla wine 11.10. Useful for regression bisects. |
 | `USE_STAGING=1` | (passed to `build-wine.sh`) build atop wine-staging (Zhang's DComp impl + broader compat backports) instead of vanilla wine 11.10. Not required for current Fusion functionality — the Data Panel renders on vanilla wine in a fresh prefix — but kept as a fallback for future compat work. |
 | `USE_CCACHE=0` | (passed to `build-wine.sh`) skip the ccache wrapping around CC / x86_64_CC. Default is on when `ccache` is present; wraps save ~4 min on warm rebuilds. |
-| `WINE_WORK_TREE=...` | (passed to `build-wine-fast.sh`) rsync `winewayland.drv/` from this tree into the cached source before rebuilding. Use when iterating on patches outside the cache. |
+| `WINE_WORK_TREE=...` | (passed to `build-wine.sh --fast`) rsync `winewayland.drv/` from this tree into the cached source before rebuilding. Use when iterating on patches outside the cache. |
 
 ### Iterating on the wine patches
 
@@ -87,35 +91,28 @@ Two rebuild modes:
 
 ```bash
 # Fast: rebuild from whatever's currently in the cached source (~30s; for iterating on edits).
-distrobox enter fusion-box -- bash scripts/build-wine-fast.sh
+distrobox enter fusion-box -- bash scripts/build-wine.sh --fast
 
 # Force-clean: re-extract wine 11.10 tarball, re-apply all patches/wine/*.patch from scratch, full configure + make + install (~5 min). 
 # Use after editing a patch file to verify it applies cleanly and produces a working binary - patches are the source of truth, cache is a build artifact.
 distrobox enter fusion-box -- bash -lc 'BUILD_WINE_FORCE=1 bash scripts/build-wine.sh'
 ```
 
-## Known Issues
+## Testing
 
-- Popups / dialogs stay visible when parent toplevel is minimized. Limitation of xdg-shell (no minimize event) - wine doesn't propagate `WM_SHOWWINDOW SW_PARENTCLOSING` to owned popups.
-- Horizontal window resize leaves echo / artifact trails. Vertical clean.
-- Dialogs / popups cut off text vertically.
-- Bottom timeline vanishes and navbar renders blank-white on vertical shrink (top-edge-down or bottom-edge-up drag). Grow direction is clean. Root cause is Qt's deferred-layout timing vs. wine's per-commit subsurface positioning; wine-side spikes exhausted (see `docs/observed-issues.md`). May be helped by patches 0011+0012 too — re-verify.
-- Data Panel (cloud projects) blank on a POLLUTED prefix from prior experimentation. Fix: reinstall Fusion into a fresh wineprefix. Fresh installs render fine.
+I only verified a simple CAD workflow for designing and exporting objects for 3D printing.
 
-See `docs/observed-issues.md` for full diagnosis, attempted-but-failed fixes, and reference to upstream wine MRs touching each area.
+### Unverified
+
+- Electronics - sample opens, but crashes on close
+- CAM
+- Simulation
+- Generative Design
 
 ## TODO
 
 - progress bars for install/build or more logging for user feedback
-- combine `build-wine.sh` and `build-wine-fast.sh`, use a `--fast` flag
 - use `COPY` for repo instead of symlinked reference
-
-Tests:
-- Test general CAD
-- Test CAM samples
-- Test Electronics samples
-- Test Design samples
-- Test Generative Design samples
 
 ## Attribution
 

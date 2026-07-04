@@ -1,7 +1,5 @@
 /* fusion-box: validate the Path-2 "GDI-buffer slice promotion" idea.
  *
- * Question this test answers (Step 0 in docs/bottom-toolbar-burial.md
- * "2026-06-09 - Path 2 reassessment"):
  *
  *   Does KWin correctly composite N wl_subsurfaces that all attach the
  *   SAME parent wl_buffer, each cropped via wp_viewport_set_source to a

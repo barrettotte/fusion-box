@@ -29,8 +29,6 @@
 #   commit bypasses the hide (per-child `virtual_committed_local` empty
 #   → we know we've never painted yet), so launch works.
 #
-# See docs/observed-issues.md patch 0006 entry for the trace analysis.
-#
 # Bug:
 # Fusion 360's center-bottom navigation toolbar (orbit/pan/zoom/fit/etc.) is a
 # Qt6 WS_CHILD widget (`Qt683QWindowIcon`) that paints its pixels into the
@@ -43,11 +41,6 @@
 # pixels live in main's buffer, so they're inherently underneath the
 # viewport's white swapchain. No subsurface z-order shuffle among main's
 # siblings can lift main's own buffer above its children.
-#
-# This was previously documented in docs/observed-issues.md as "no
-# winewayland.drv-only fix exists" - the Qt6 paint-target / DXVK
-# render-target architectural mismatch. See docs/bottom-toolbar-burial.md
-# for the full investigation.
 #
 # Fix (Path 2 from bottom-toolbar-burial.md, "GDI-buffer slice promotion"):
 # For each Qt6 WS_CHILD widget that (a) is visible with a non-empty rect,

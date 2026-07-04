@@ -11,8 +11,7 @@
 # Extra args (except --recreate) are passed through to `distrobox create`.
 
 set -euo pipefail
-cd "$(dirname "$0")"
-REPO_DIR="$(pwd)"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 IMAGE=localhost/fusion-box:latest
 NAME=fusion-box
@@ -37,8 +36,10 @@ if [ -n "${BOX_HOME:-}" ]; then
     fi
 fi
 
-echo "==> Building image $IMAGE"
-podman build -t "$IMAGE" -f Containerfile .
+echo "==> Building image $IMAGE (cold ~5 min; warm/cached ~10s)"
+SECONDS=0
+podman build -t "$IMAGE" -f "$REPO_DIR/Containerfile" "$REPO_DIR"
+echo "==> Image built in ${SECONDS}s"
 
 if distrobox list 2>/dev/null | awk '{print $3}' | grep -qx "$NAME"; then
     if [ "$RECREATE" = 1 ]; then
@@ -51,7 +52,9 @@ if distrobox list 2>/dev/null | awk '{print $3}' | grep -qx "$NAME"; then
 fi
 
 echo "==> Creating container $NAME (args: ${PASS_ARGS[*]:-none})"
+SECONDS=0
 distrobox create --image "$IMAGE" --name "$NAME" "${PASS_ARGS[@]}"
+echo "==> Container created in ${SECONDS}s"
 
 cat <<EOF
 
