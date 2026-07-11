@@ -60,6 +60,69 @@
 # owner HWND, stay TOPLEVEL regardless of transient style / parent
 # surface state.
 #
+# Wine common-dialog carve-out (2026-07-11):
+# The gate above catches ANY child window with WS_CAPTION and an owner,
+# including wine's own common dialogs registered under class atom 32770
+# ("#32770") - SHBrowseForFolder, GetOpenFileName, GetSaveFileName.
+# When Fusion's Qt "Save As Mesh" dialog opens the wine folder-picker
+# ("Select Location"), that picker is class #32770 with owner = the Qt
+# dialog. Treating it as an owned dialog routes it through our
+# xdg_toplevel + set_parent path, and Qt's SWP_FRAMECHANGED churn during
+# picker setup triggers our latch's TOPLEVEL retention which then
+# repeatedly recreates the picker's wl_surface (traced 12+ recreations
+# per open). KWin promotes the parent Qt dialog to "backgrounded modal
+# parent" during this churn, and Qt only partially repaints the
+# backgrounded surface - leaving the filename QLineEdit and Cancel
+# button visible at their correct in-dialog Y coords over a mostly-
+# transparent buffer. Result on screen: two floating widgets over the
+# black viewport while the picker on the right renders fine.
+#
+# Fix (five carve-outs, all keyed on is_wine_common_dialog):
+#   1. Skip the owner-walk block. Otherwise it sets popup_parent_surface
+#      for #32770 via non-WS_POPUP owner detection.
+#   2. Skip the is_owned_dialog gate (avoid xdg_toplevel + set_parent
+#      that caused the fragmentation).
+#   3. Skip the TOPLEVEL retention latch.
+#   4. Gate the role-decision cascade so `else if (popup_parent_surface)
+#      role = POPUP` also skips #32770. The picker has WS_POPUP set
+#      (style 0x82cc20c4), so patch 0004's WS_POPUP+owner block sets
+#      popup_parent_surface before patch 0013's code runs. Without
+#      gating the role cascade the picker still lands in xdg_popup
+#      role, and the compositor places the popup surface with (0,0)
+#      at the top of the client area — but wine's WindowFromPoint
+#      uses surface-Y directly as Win32 window-Y without accounting
+#      for the non-client area. Hit-tests come out ~one tree-row too
+#      high (16-18px).
+#   5. Force CSD (no SSD) for #32770 via
+#      `wayland_surface_make_toplevel(surface, 0)` instead of
+#      `get_mwm_decoration(data)`. Without this, KWin's SSD path
+#      draws the title bar OUTSIDE the wl_surface and wine paints
+#      the DIB starting at client-Y=0 — but wine's Win32 coord model
+#      still reports client area at window.top + 30 (the non-client
+#      offset). So wine paints Save/Cancel buttons at DIB-Y=390 but
+#      WindowFromPoint expects them at window-Y=420. Result: buttons
+#      visible, but user has to click ~30px below to hit them.
+#      Forcing CSD makes wine draw its own title bar into the DIB at
+#      DIB-Y=0..30, shifting client rendering down by 30px in the
+#      buffer — paint-Y == hit-test-Y, buttons align.
+# With all five gates active, #32770 windows fall through to the default
+# WAYLAND_SURFACE_ROLE_TOPLEVEL, wine draws its own title bar into the
+# DIB, and both pointer coords and widget paint align.
+#
+# Residual cosmetic (2026-07-11, low severity, not blocking): tree-click
+# in the picker briefly shows a grey horizontal bar over the file-list
+# area — the `SysHeader32` column header (~502×17px) that gets
+# recreated by SHELLDLL_DefView on each tree navigation and paints
+# with empty columns before the file list populates. Not a coord bug;
+# not fixable from winewayland.drv (buried in wine's comdlg32/shell32
+# repaint sequence). Documented in tmp/observed-issues.md.
+# Wine common dialogs render as bare xdg_toplevel with KWin SSD - no
+# minimize propagation from parent needed, since wine's Win32 modal
+# loop already blocks the parent Qt dialog while the picker is open.
+# Cosmetic side effect: KWin decides picker placement independently and
+# won't center it over the parent (Wayland forbids client-driven
+# positioning for xdg_toplevel by spec).
+#
 # Known limitation: Fusion's Export dialog (spawned via the embedded Edge
 # WebView2 UI layer) has GW_OWNER=NULL at wine's Win32 layer - the
 # WebView2 process's Chromium windowing doesn't set a Windows owner
@@ -78,21 +141,39 @@
 #   Not fixed: Export dialog (GW_OWNER=NULL under WebView2). Same
 #              behavior as pre-patch: independent toplevel with a plain
 #              SSD titlebar, no minimize propagation.
+# Verification: 2026-07-11 against Fusion 360 v2707.1.10 on KDE Plasma 6.
+#   Fixed:     Save-As-Mesh → "Save to my computer" → Change Location
+#              file picker no longer fragments the parent Qt dialog.
+#              Preferences minimize propagation still works (Qt dialog
+#              class is not #32770 so the carve-out doesn't affect it).
 #
 # Related:
 #   - patches/wine/0004-winewayland-xdg-popup-support.patch (this patch
 #     is a targeted carve-out of 0004's role decision).
 
---- a/dlls/winewayland.drv/window.c	2026-07-03 20:36:32.044745139 -0400
-+++ b/dlls/winewayland.drv/window.c	2026-07-03 20:38:40.235751752 -0400
-@@ -367,7 +367,59 @@
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -367,8 +367,79 @@
          }
      }
- 
+
++    /* fusion-box: exclude wine's own #32770 common-dialog class
++     * (SHBrowseForFolder, GetOpenFileName, GetSaveFileName). Kept OUT of the
++     * owner-walk + is_owned_dialog + latch paths — see patch 0013 header. */
++    static const WCHAR wc_dialog_classW[] = { '#','3','2','7','7','0',0 };
++    WCHAR class_name[16] = {0};
++    UNICODE_STRING class_str = { .Buffer = class_name,
++                                 .MaximumLength = sizeof(class_name) };
++    BOOL is_wine_common_dialog =
++        NtUserGetClassName(data->hwnd, FALSE, &class_str) &&
++        !wcscmp(class_name, wc_dialog_classW);
++
 +    /* fusion-box: owner-walk for non-WS_POPUP dialogs (patch 0004 only
-+     * catches WS_POPUP). See patch 0013 header. */
++     * catches WS_POPUP). Skipped for wine's own common dialogs so they
++     * stay as bare xdg_toplevel (KWin SSD outside surface → pointer
++     * coords align). See patch 0013 header. */
 +    if (visible && !popup_parent_surface && !toplevel_surface &&
-+        !(style & WS_CHILD))
++        !(style & WS_CHILD) && !is_wine_common_dialog)
 +    {
 +        HWND ancestor_hwnd = NtUserGetWindowRelative(data->hwnd, GW_OWNER);
 +        /* Walk owner chain to find one with a live wayland_surface. */
@@ -122,6 +203,7 @@
 +    BOOL is_owned_dialog = popup_parent_surface &&
 +                           popup_parent_surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
 +                           popup_parent_surface->xdg_toplevel &&
++                           !is_wine_common_dialog &&
 +                           ((style & WS_CAPTION) == WS_CAPTION ||
 +                            !(style & WS_POPUP));
 +
@@ -129,7 +211,7 @@
 +     * SWP_FRAMECHANGED cycles transiently drop WS_CAPTION or nil the
 +     * parent xdg_toplevel; keep TOPLEVEL if we already had one and an
 +     * owner is still resolvable. See patch 0013 header. */
-+    if (!is_owned_dialog && data->wayland_surface &&
++    if (!is_owned_dialog && !is_wine_common_dialog && data->wayland_surface &&
 +        data->wayland_surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
 +        popup_owner_hwnd && popup_owner_hwnd != data->hwnd)
 +    {
@@ -141,14 +223,33 @@
 +    }
 +
      if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
+-    else if (popup_parent_surface) role = WAYLAND_SURFACE_ROLE_POPUP;
 +    else if (is_owned_dialog) role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
-     else if (popup_parent_surface) role = WAYLAND_SURFACE_ROLE_POPUP;
++    /* fusion-box: #32770 common dialogs bypass the POPUP branch even when
++     * patch 0004's WS_POPUP+owner path set popup_parent_surface — otherwise
++     * they end up as xdg_popup with wine's non-client title-bar area
++     * inside the surface, misaligning pointer coords by ~one row.
++     * See patch 0013 header. */
++    else if (popup_parent_surface && !is_wine_common_dialog) role = WAYLAND_SURFACE_ROLE_POPUP;
      else if (toplevel_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
      else role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
-@@ -419,6 +471,15 @@
+
+@@ -418,7 +489,26 @@
+         wayland_surface_clear_role(surface);
          break;
      case WAYLAND_SURFACE_ROLE_TOPLEVEL:
-         wayland_surface_make_toplevel(surface, get_mwm_decoration(data));
+-        wayland_surface_make_toplevel(surface, get_mwm_decoration(data));
++        /* fusion-box: force CSD (no SSD) for wine's own #32770 common dialogs.
++         * Wine's WindowFromPoint translates surface-Y to Win32-Y using
++         * window.top which INCLUDES the 30px non-client offset — but under
++         * SSD, wine paints the DIB starting at client-Y=0 (KWin drew the
++         * title bar outside the surface). Widgets end up painted 30px above
++         * where hit-tests find them. Forcing CSD makes wine draw its own
++         * title bar into the DIB at Y=0..30, shifting the client-area
++         * rendering down by 30px — matching Win32's non-client model so
++         * paint-Y == hit-test-Y. See patch 0013 header. */
++        wayland_surface_make_toplevel(surface,
++            is_wine_common_dialog ? 0 : get_mwm_decoration(data));
 +        /* fusion-box: set_parent so KWin propagates minimize. See patch 0013. */
 +        if (is_owned_dialog && surface->xdg_toplevel &&
 +            popup_parent_surface && popup_parent_surface->xdg_toplevel)
